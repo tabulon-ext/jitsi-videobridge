@@ -15,13 +15,15 @@
  */
 package org.jitsi.videobridge.cc.vp9
 
-import org.jitsi.nlj.codec.vpx.PictureIdIndexTracker
 import org.jitsi.nlj.codec.vpx.VpxUtils.Companion.getExtendedPictureIdDelta
 import org.jitsi.nlj.rtp.codec.vp9.Vp9Packet
 import org.jitsi.nlj.util.ArrayCache
+import org.jitsi.nlj.util.PictureIdIndexTracker
 import org.jitsi.rtp.util.RtpUtils
 import org.jitsi.utils.logging2.Logger
 import org.jitsi.utils.logging2.createChildLogger
+import kotlin.math.max
+import kotlin.math.min
 
 /**
  * A history of recent pictures on a VP9 stream.
@@ -35,14 +37,10 @@ class Vp9PictureMap(
 
     /** Find a picture in the picture map, based on a packet.  */
     @Synchronized
-    fun findPicture(packet: Vp9Packet): Vp9Picture? {
-        return pictureHistory[packet.pictureId]
-    }
+    fun findPicture(packet: Vp9Packet): Vp9Picture? = pictureHistory[packet.pictureId]
 
     /** Get the current size of the map.  */
-    fun size(): Int {
-        return pictureHistory.numCached
-    }
+    fun size(): Int = pictureHistory.numCached
 
     /** Check whether this is a large jump from previous state, so the map should be reset.  */
     private fun isLargeJump(packet: Vp9Packet): Boolean {
@@ -81,12 +79,9 @@ class Vp9PictureMap(
         }
         if (isLargeJump(packet)) {
             pictureHistory.indexTracker.resetAt(pictureId)
-            val picture = Vp9Picture(packet)
-            return if (!pictureHistory.insert(pictureId, picture)) {
-                null
-            } else {
-                PacketInsertionResult(picture.frame(packet)!!, picture, true, isReset = true)
-            }
+            val picture = pictureHistory.insert(packet) ?: return null
+
+            return PacketInsertionResult(picture.frame(packet)!!, picture, true, isReset = true)
         }
         val picture = pictureHistory[pictureId]
         if (picture != null) {
@@ -118,48 +113,33 @@ class Vp9PictureMap(
             return picture.addPacket(packet)
         }
 
-        val newPicture = Vp9Picture(packet)
-        return if (!pictureHistory.insert(pictureId, newPicture)) {
-            null
-        } else {
-            PacketInsertionResult(newPicture.frame(packet)!!, newPicture, true)
-        }
+        val newPicture = pictureHistory.insert(packet) ?: return null
+
+        return PacketInsertionResult(newPicture.frame(packet)!!, newPicture, true)
     }
 
     @Synchronized
-    fun nextFrame(frame: Vp9Frame): Vp9Frame? {
-        return pictureHistory.findAfter(frame) { true }
-    }
+    fun nextFrame(frame: Vp9Frame): Vp9Frame? = pictureHistory.findAfter(frame) { true }
 
     @Synchronized
-    fun nextFrameWith(frame: Vp9Frame, pred: (Vp9Frame) -> Boolean): Vp9Frame? {
-        return pictureHistory.findAfter(frame, pred)
-    }
+    fun nextFrameWith(frame: Vp9Frame, pred: (Vp9Frame) -> Boolean): Vp9Frame? = pictureHistory.findAfter(frame, pred)
 
     @Synchronized
-    fun prevFrame(frame: Vp9Frame): Vp9Frame? {
-        return pictureHistory.findBefore(frame) { true }
-    }
+    fun prevFrame(frame: Vp9Frame): Vp9Frame? = pictureHistory.findBefore(frame) { true }
 
     @Synchronized
-    fun prevFrameWith(frame: Vp9Frame, pred: (Vp9Frame) -> Boolean): Vp9Frame? {
-        return pictureHistory.findBefore(frame, pred)
-    }
+    fun prevFrameWith(frame: Vp9Frame, pred: (Vp9Frame) -> Boolean): Vp9Frame? = pictureHistory.findBefore(frame, pred)
 
-    fun findPrevAcceptedFrame(frame: Vp9Frame): Vp9Frame? {
-        return prevFrameWith(frame) { it.isAccepted }
-    }
+    fun findPrevAcceptedFrame(frame: Vp9Frame): Vp9Frame? = prevFrameWith(frame) { it.isAccepted }
 
-    fun findNextAcceptedFrame(frame: Vp9Frame): Vp9Frame? {
-        return nextFrameWith(frame) { it.isAccepted }
-    }
+    fun findNextAcceptedFrame(frame: Vp9Frame): Vp9Frame? = nextFrameWith(frame) { it.isAccepted }
 
-    fun findNextBaseTl0(frame: Vp9Frame): Vp9Frame? {
-        return nextFrameWith(frame) { it.spatialLayer <= 0 && it.temporalLayer <= 0 }
+    fun findNextBaseTl0(frame: Vp9Frame): Vp9Frame? = nextFrameWith(frame) {
+        it.spatialLayer <= 0 && it.temporalLayer <= 0
     }
 
     companion object {
-        const val PICTURE_MAP_SIZE = 500 /* Matches PacketCache default size. */
+        const val PICTURE_MAP_SIZE = 500 // Matches PacketCache default size.
     }
 }
 
@@ -170,8 +150,8 @@ constructor(size: Int) : ArrayCache<Vp9Picture>(
     synchronize = false
 ) {
     var numCached = 0
-    var firstIndex = -1
-    var indexTracker = PictureIdIndexTracker()
+    var firstIndex = -1L
+    val indexTracker = PictureIdIndexTracker()
 
     /**
      * Gets a picture with a given VP9 picture ID from the cache.
@@ -184,7 +164,7 @@ constructor(size: Int) : ArrayCache<Vp9Picture>(
     /**
      * Gets a picture with a given VP9 picture ID index from the cache.
      */
-    private fun getIndex(index: Int): Vp9Picture? {
+    private fun getIndex(index: Long): Vp9Picture? {
         if (index <= lastIndex - size) {
             /* We don't want to remember old pictures even if they're still
                tracked; their neighboring pictures may have been evicted,
@@ -199,16 +179,20 @@ constructor(size: Int) : ArrayCache<Vp9Picture>(
     val latestPicture: Vp9Picture?
         get() = getIndex(lastIndex)
 
-    fun insert(pictureId: Int, picture: Vp9Picture): Boolean {
+    /** Insert a new picture for the given Vp9 packet */
+    fun insert(packet: Vp9Packet): Vp9Picture? {
+        val pictureId = packet.pictureId
         val index = indexTracker.update(pictureId)
-        val ret = super.insertItem(picture, index)
-        if (ret) {
+        val picture = Vp9Picture(packet, index)
+        val inserted = super.insertItem(picture, index)
+        if (inserted) {
             numCached++
-            if (firstIndex == -1 || index < firstIndex) {
+            if (firstIndex == -1L || index < firstIndex) {
                 firstIndex = index
             }
+            return picture
         }
-        return ret
+        return null
     }
 
     /**
@@ -220,12 +204,12 @@ constructor(size: Int) : ArrayCache<Vp9Picture>(
 
     fun findBefore(frame: Vp9Frame, pred: (Vp9Frame) -> Boolean): Vp9Frame? {
         val lastIndex = lastIndex
-        if (lastIndex == -1) {
+        if (lastIndex == -1L) {
             return null
         }
         val index = indexTracker.interpret(frame.pictureId)
-        val searchStartIndex = Integer.min(index, lastIndex)
-        val searchEndIndex = Integer.max(lastIndex - size, firstIndex - 1)
+        val searchStartIndex = min(index, lastIndex)
+        val searchEndIndex = max(lastIndex - size, firstIndex - 1)
         return doFind(
             pred = pred,
             startIndex = searchStartIndex,
@@ -237,14 +221,14 @@ constructor(size: Int) : ArrayCache<Vp9Picture>(
 
     fun findAfter(frame: Vp9Frame, pred: (Vp9Frame) -> Boolean): Vp9Frame? {
         val lastIndex = lastIndex
-        if (lastIndex == -1) {
+        if (lastIndex == -1L) {
             return null
         }
         val index = indexTracker.interpret(frame.pictureId)
         if (index > lastIndex) {
             return null
         }
-        val searchStartIndex = Integer.max(index, Integer.max(lastIndex - size + 1, firstIndex))
+        val searchStartIndex = max(index, max(lastIndex - size + 1, firstIndex))
         return doFind(
             pred = pred,
             startIndex = searchStartIndex,
@@ -256,11 +240,15 @@ constructor(size: Int) : ArrayCache<Vp9Picture>(
 
     private fun doFind(
         pred: (Vp9Frame) -> Boolean,
-        startIndex: Int,
-        endIndex: Int,
+        startIndex: Long,
+        endIndex: Long,
         startLayer: Int,
         increment: Int
     ): Vp9Frame? {
+        require((increment > 0 && startIndex <= endIndex) || (increment < 0 && startIndex >= endIndex)) {
+            "Values of startIndex=$startIndex, endIndex=$endIndex, and increment=$increment " +
+                "could lead to infinite loop"
+        }
         var index = startIndex
         var layer = startLayer
         var firstPicture = true

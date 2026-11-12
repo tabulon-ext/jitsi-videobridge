@@ -17,18 +17,18 @@
 package org.jitsi.videobridge.xmpp;
 
 import org.jitsi.nlj.*;
+import org.jitsi.nlj.rtp.SsrcAssociationType;
 import org.jitsi.xmpp.extensions.colibri.*;
 import org.jitsi.xmpp.extensions.jingle.*;
+import org.jitsi.xmpp.extensions.jitsimeet.SSRCInfoPacketExtension;
 import org.junit.*;
-import org.junit.runner.*;
-import org.powermock.modules.junit4.*;
+import org.jxmpp.jid.impl.JidCreate;
+import org.jxmpp.stringprep.XmppStringprepException;
 
 import java.util.*;
 
 import static org.junit.Assert.*;
-import static org.powermock.api.easymock.PowerMock.*;
 
-@RunWith(PowerMockRunner.class)
 public class MediaSourceFactoryTest
 {
     private SourceGroupPacketExtension createGroup(
@@ -55,38 +55,27 @@ public class MediaSourceFactoryTest
         return spe;
     }
 
-    @After
-    public void tearDown()
-    {
-        verifyAll();
-    }
-
     // 1 video stream -> 1 source, 1 layer
     @Test
     public void createMediaSource()
     {
-        replayAll();
-
         long videoSsrc = 12345;
 
         SourcePacketExtension videoSource = createSource(videoSsrc);
 
-        MediaSourceDesc[] sources =
-            MediaSourceFactory.createMediaSources(
-                Collections.singletonList(videoSource), Collections.emptyList());
+        MediaSourceDesc source =
+            MediaSourceFactory.createMediaSource(
+                Collections.singletonList(videoSource), Collections.emptyList(), "E1", "S1");
 
-        assertNotNull(sources);
-        assertEquals(1, sources.length);
-        MediaSourceDesc source = sources[0];
+        assertNotNull(source);
         assertEquals(3, source.numRtpLayers());
+        assertEquals(videoSsrc, source.getPrimarySSRC());
     }
 
     // 1 video stream, 1 rtx -> 1 source, 1 layer
     @Test
     public void createMediaSources1()
     {
-        replayAll();
-
         long videoSsrc = 12345;
         long rtxSsrc = 54321;
 
@@ -97,22 +86,19 @@ public class MediaSourceFactoryTest
             = createGroup(
                 SourceGroupPacketExtension.SEMANTICS_FID, videoSource, rtx);
 
-        MediaSourceDesc[] sources =
-            MediaSourceFactory.createMediaSources(
-                Arrays.asList(videoSource, rtx), Collections.singletonList(rtxGroup));
+        MediaSourceDesc source =
+            MediaSourceFactory.createMediaSource(
+                Arrays.asList(videoSource, rtx), Collections.singletonList(rtxGroup), "E1", "S1");
 
-        assertNotNull(sources);
-        assertEquals(1, sources.length);
-        MediaSourceDesc source = sources[0];
         assertEquals(3, source.numRtpLayers());
+        assertEquals(videoSsrc, source.getPrimarySSRC());
+        assertEquals(rtxSsrc, source.getRtpEncodings()[0].getSecondarySsrc(SsrcAssociationType.RTX));
     }
 
     // 3 sim streams, 3 rtx -> 1 source, 9 layers
     @Test
     public void createMediaSources2()
     {
-        replayAll();
-
         long videoSsrc1 = 12345;
         long videoSsrc2 = 23456;
         long videoSsrc3 = 34567;
@@ -143,24 +129,24 @@ public class MediaSourceFactoryTest
             = createGroup(
                 SourceGroupPacketExtension.SEMANTICS_FID, videoSource3, rtx3);
 
-        MediaSourceDesc[] sources =
-            MediaSourceFactory.createMediaSources(
+        MediaSourceDesc source =
+            MediaSourceFactory.createMediaSource(
                 Arrays.asList(
                     videoSource1, videoSource2, videoSource3, rtx1, rtx2, rtx3),
-                Arrays.asList(simGroup, rtxGroup1, rtxGroup2, rtxGroup3));
+                Arrays.asList(simGroup, rtxGroup1, rtxGroup2, rtxGroup3),
+                "E1",
+                "S1"
+            );
 
-        assertNotNull(sources);
-        assertEquals(1, sources.length);
-        MediaSourceDesc source = sources[0];
+        assertNotNull(source);
         assertEquals(9, source.numRtpLayers());
+        assertEquals(videoSsrc1, source.getPrimarySSRC());
     }
 
     // 3 sim streams, svc enabled, 3 rtx -> 1 source, 3 layers
     @Test
     public void createMediaSources3()
     {
-        replayAll();
-
         long videoSsrc1 = 12345;
         long videoSsrc2 = 23456;
         long videoSsrc3 = 34567;
@@ -189,83 +175,35 @@ public class MediaSourceFactoryTest
             = createGroup(
                 SourceGroupPacketExtension.SEMANTICS_FID, videoSource3, rtx3);
 
-        MediaSourceDesc[] sources =
-            MediaSourceFactory.createMediaSources(
+        MediaSourceDesc source =
+            MediaSourceFactory.createMediaSource(
                 Arrays.asList(
                     videoSource1, videoSource2, videoSource3, rtx1, rtx2, rtx3),
-                Arrays.asList(simGroup, rtxGroup1, rtxGroup2, rtxGroup3));
+                Arrays.asList(simGroup, rtxGroup1, rtxGroup2, rtxGroup3),
+                "E1",
+                "S1"
+            );
 
-        assertNotNull(sources);
-        assertEquals(1, sources.length);
-        MediaSourceDesc source = sources[0];
+        assertNotNull(source);
         assertEquals(9, source.numRtpLayers());
-    }
 
-    // 3 sim streams with rtx, 1 stream with rtx, 1 stream without rtx
-    @Test
-    public void createMediaSources4()
-    {
-        replayAll();
+        RtpEncodingDesc[] encodings = source.getRtpEncodings();
+        assertNotNull(encodings);
+        assertEquals(3, encodings.length);
 
-        long videoSsrc1 = 12345;
-        long videoSsrc2 = 23456;
-        long videoSsrc3 = 34567;
-        long videoSsrc4 = 45678;
-        long videoSsrc5 = 56789;
-        long rtxSsrc1 = 54321;
-        long rtxSsrc2 = 43215;
-        long rtxSsrc3 = 32154;
-        long rtxSsrc4 = 21543;
+        assertEquals(videoSsrc1, encodings[0].getPrimarySSRC());
+        assertEquals(rtxSsrc1, encodings[0].getSecondarySsrc(SsrcAssociationType.RTX));
 
-        SourcePacketExtension videoSource1 = createSource(videoSsrc1);
-        SourcePacketExtension videoSource2 = createSource(videoSsrc2);
-        SourcePacketExtension videoSource3 = createSource(videoSsrc3);
-        SourcePacketExtension videoSource4 = createSource(videoSsrc4);
-        SourcePacketExtension videoSource5 = createSource(videoSsrc5);
-        SourcePacketExtension rtx1 = createSource(rtxSsrc1);
-        SourcePacketExtension rtx2 = createSource(rtxSsrc2);
-        SourcePacketExtension rtx3 = createSource(rtxSsrc3);
-        SourcePacketExtension rtx4 = createSource(rtxSsrc4);
+        assertEquals(videoSsrc2, encodings[1].getPrimarySSRC());
+        assertEquals(rtxSsrc2, encodings[1].getSecondarySsrc(SsrcAssociationType.RTX));
 
-        SourceGroupPacketExtension simGroup
-            = createGroup(
-                SourceGroupPacketExtension.SEMANTICS_SIMULCAST,
-                videoSource1,
-                videoSource2,
-                videoSource3);
-        SourceGroupPacketExtension rtxGroup1
-            = createGroup(
-                SourceGroupPacketExtension.SEMANTICS_FID, videoSource1, rtx1);
-        SourceGroupPacketExtension rtxGroup2
-            = createGroup(
-                SourceGroupPacketExtension.SEMANTICS_FID, videoSource2, rtx2);
-        SourceGroupPacketExtension rtxGroup3
-            = createGroup(
-                SourceGroupPacketExtension.SEMANTICS_FID, videoSource3, rtx3);
-        SourceGroupPacketExtension rtxGroup4
-            = createGroup(
-            SourceGroupPacketExtension.SEMANTICS_FID, videoSource4, rtx4);
-
-        MediaSourceDesc[] sources =
-            MediaSourceFactory.createMediaSources(
-                Arrays.asList(
-                    videoSource1, videoSource2, videoSource3, videoSource4,
-                    videoSource5, rtx1, rtx2, rtx3, rtx4),
-                Arrays.asList(
-                    simGroup, rtxGroup1, rtxGroup2, rtxGroup3, rtxGroup4));
-
-        assertNotNull(sources);
-        assertEquals(3, sources.length);
-        assertEquals(9, sources[0].numRtpLayers());
-        assertEquals(3, sources[1].numRtpLayers());
-        assertEquals(3, sources[2].numRtpLayers());
+        assertEquals(videoSsrc3, encodings[2].getPrimarySSRC());
+        assertEquals(rtxSsrc3, encodings[2].getSecondarySsrc(SsrcAssociationType.RTX));
     }
 
     @Test
     public void testEmptySimGroup()
     {
-        replayAll();
-
         long videoSsrc1 = 12345;
 
         SourcePacketExtension videoSource1 = createSource(videoSsrc1);
@@ -274,32 +212,90 @@ public class MediaSourceFactoryTest
             = createGroup(
             SourceGroupPacketExtension.SEMANTICS_SIMULCAST);
 
-        MediaSourceDesc[] sources =
-            MediaSourceFactory.createMediaSources(
+        MediaSourceDesc source =
+            MediaSourceFactory.createMediaSource(
                 Collections.singletonList(videoSource1),
-                Collections.singletonList(simGroup)
+                Collections.singletonList(simGroup),
+                "E1",
+                "S1"
             );
 
-        assertNotNull(sources);
-        assertEquals(1, sources.length);
-        MediaSourceDesc source = sources[0];
+        assertNotNull(source);
         assertEquals(3, source.numRtpLayers());
     }
 
     @Test
     public void testEmptySource()
     {
-        replayAll();
-
         SourcePacketExtension videoSource1 = createSource(null);
+
+        MediaSourceDesc source =
+            MediaSourceFactory.createMediaSource(
+                Collections.singletonList(videoSource1),
+                Collections.emptyList(),
+                "E1",
+                "S1"
+            );
+
+        assertNull(source);
+    }
+
+    @Test
+    public void testSourceNameWithSingleSource()
+        throws XmppStringprepException
+    {
+        String testName = "endpoint1-v0";
+        SourcePacketExtension videoSource1 = createSource(1L);
+
+        videoSource1.setName(testName);
+
+        SSRCInfoPacketExtension ssrcInfoPacketExtension = new SSRCInfoPacketExtension();
+        ssrcInfoPacketExtension.setOwner(JidCreate.from("chat@server.com/nick1"));
+        videoSource1.addChildExtension(ssrcInfoPacketExtension);
 
         MediaSourceDesc[] sources =
             MediaSourceFactory.createMediaSources(
-                Collections.singletonList(videoSource1),
-                Collections.emptyList()
+                    Collections.singletonList(videoSource1),
+                    Collections.emptyList()
             );
 
-        assertNotNull(sources);
-        assertEquals(0, sources.length);
+        assertEquals(testName, sources[0].getSourceName());
+    }
+
+    @Test
+    public void testSourceNameThreeSources() throws XmppStringprepException {
+        String testName = "endpoint1-v0";
+        long videoSsrc1 = 12345;
+        long videoSsrc2 = 23456;
+        long videoSsrc3 = 34567;
+
+        SourcePacketExtension videoSource1 = createSource(videoSsrc1);
+        SourcePacketExtension videoSource2 = createSource(videoSsrc2);
+        SourcePacketExtension videoSource3 = createSource(videoSsrc3);
+
+        SourceGroupPacketExtension simGroup
+            = createGroup(
+                SourceGroupPacketExtension.SEMANTICS_SIMULCAST,
+                videoSource1,
+                videoSource2,
+                videoSource3);
+
+        // Only primary SSRC matters
+        videoSource1.setName(testName);
+        videoSource2.setName("something else");
+        videoSource3.setName("something3");
+
+        SSRCInfoPacketExtension ssrcInfoPacketExtension = new SSRCInfoPacketExtension();
+        ssrcInfoPacketExtension.setOwner(JidCreate.from("chat@server.com/nick1"));
+        videoSource1.addChildExtension(ssrcInfoPacketExtension);
+
+        MediaSourceDesc[] sources =
+                MediaSourceFactory.createMediaSources(
+                        Arrays.asList(
+                                videoSource1, videoSource2, videoSource3),
+                        Arrays.asList(simGroup));
+
+        assertEquals(1, sources.length);
+        assertEquals(testName, sources[0].getSourceName());
     }
 }

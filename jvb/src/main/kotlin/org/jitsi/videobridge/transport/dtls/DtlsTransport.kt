@@ -16,13 +16,19 @@
 
 package org.jitsi.videobridge.transport.dtls
 
+import com.fasterxml.jackson.databind.node.JsonNodeFactory
+import com.fasterxml.jackson.databind.node.ObjectNode
+import org.bouncycastle.tls.TlsTimeoutException
+import org.ice4j.util.Buffer
 import org.jitsi.nlj.dtls.DtlsClient
 import org.jitsi.nlj.dtls.DtlsServer
 import org.jitsi.nlj.dtls.DtlsStack
 import org.jitsi.nlj.srtp.TlsRole
-import org.jitsi.nlj.util.OrderedJsonObject
+import org.jitsi.nlj.util.BufferPool
 import org.jitsi.utils.logging2.Logger
 import org.jitsi.utils.logging2.createChildLogger
+import org.jitsi.utils.queue.PacketQueue
+import org.jitsi.videobridge.util.TaskPools
 import org.jitsi.xmpp.extensions.jingle.DtlsFingerprintPacketExtension
 import org.jitsi.xmpp.extensions.jingle.IceUdpTransportPacketExtension
 import java.util.concurrent.atomic.AtomicBoolean
@@ -39,14 +45,17 @@ import java.util.concurrent.atomic.AtomicBoolean
  * be passed to the [outgoingDataHandler], which should be set by an
  * interested party.
  */
-class DtlsTransport(parentLogger: Logger) {
+class DtlsTransport(parentLogger: Logger, id: String) {
     private val logger = createChildLogger(parentLogger)
 
     private val running = AtomicBoolean(true)
+
     @JvmField
     var incomingDataHandler: IncomingDataHandler? = null
+
     @JvmField
     var outgoingDataHandler: OutgoingDataHandler? = null
+
     @JvmField
     var eventHandler: EventHandler? = null
     private var dtlsHandshakeComplete = false
@@ -55,6 +64,39 @@ class DtlsTransport(parentLogger: Logger) {
         get() = dtlsHandshakeComplete
 
     private val stats = Stats()
+
+    /** Whether to advertise cryptex to peers. */
+    var cryptex = false
+
+    val dtlsQueue = object : PacketQueue<Buffer>(
+        128,
+        null,
+        "dtls-queue-$id",
+        { buffer: Buffer ->
+            try {
+                dtlsDataReceived(buffer.buffer, buffer.offset, buffer.length)
+                true
+            } catch (e: Exception) {
+                logger.warn("Failed to handle DTLS data", e)
+                false
+            } finally {
+                // The DTLS stack copies the data, and the buffer came from the pool (see IceTransport).
+                BufferPool.returnBuffer(buffer.buffer)
+            }
+        },
+        TaskPools.IO_POOL,
+    ) {
+        override fun releasePacket(buffer: Buffer) {
+            BufferPool.returnBuffer(buffer.buffer)
+        }
+
+        /** Takes ownership of the buffer even when the queue is closed (it is returned to the pool). */
+        override fun tryAdd(buffer: Buffer): Boolean = super.tryAdd(buffer).also { accepted ->
+            if (!accepted) {
+                releasePacket(buffer)
+            }
+        }
+    }
 
     /**
      * The DTLS stack instance
@@ -99,31 +141,44 @@ class DtlsTransport(parentLogger: Logger) {
      * (via [setSetupAttribute]
      */
     fun startDtlsHandshake() {
-        logger.info("Starting DTLS handshake")
+        logger.info("Starting DTLS handshake, role=${dtlsStack.role?.javaClass?.simpleName}")
         if (dtlsStack.role == null) {
-            logger.warn("Staring the DTLS stack before it knows its role")
+            logger.warn("Starting the DTLS stack before it knows its role")
         }
         try {
             dtlsStack.start()
+        } catch (t: TlsTimeoutException) {
+            // The remote side did not complete the handshake in time (e.g. it went away). This is not a failure of the
+            // bridge.
+            logger.warn("DTLS handshake timed out.")
         } catch (t: Throwable) {
             // TODO: we're not doing anything here, should we? or change the log?
             logger.error("Error during DTLS negotiation, closing this transport manager", t)
         }
     }
 
+    /**
+     * Applies the peer's `setup` attribute. This is called for every transport update that carries a fingerprint,
+     * including the ones that have nothing to do with DTLS (an ICE restart, a trickled candidate), so re-applying
+     * the role we already have does nothing and is not logged.
+     */
     fun setSetupAttribute(setupAttr: String?) {
         if (setupAttr.isNullOrEmpty()) {
             return
         }
-        when (setupAttr.toLowerCase()) {
+        when (setupAttr.lowercase()) {
             "active" -> {
-                logger.info("The remote side is acting as DTLS client, we'll act as server")
-                dtlsStack.actAsServer()
+                if (dtlsStack.actAsServer()) {
+                    logger.info("The remote side is acting as DTLS client, we'll act as server")
+                }
             }
+
             "passive" -> {
-                logger.info("The remote side is acting as DTLS server, we'll act as client")
-                dtlsStack.actAsClient()
+                if (dtlsStack.actAsClient()) {
+                    logger.info("The remote side is acting as DTLS server, we'll act as client")
+                }
             }
+
             else -> {
                 logger.error(
                     "The remote side sent an unrecognized DTLS setup value: " +
@@ -133,7 +188,7 @@ class DtlsTransport(parentLogger: Logger) {
         }
     }
 
-    fun setRemoteFingerprints(remoteFingerprints: Map<String, String>) {
+    fun setRemoteFingerprints(remoteFingerprints: Map<String, List<String>>) {
         // Don't pass an empty list to the stack in order to avoid wiping
         // certificates that were contained in a previous request.
         if (remoteFingerprints.isEmpty()) {
@@ -141,14 +196,6 @@ class DtlsTransport(parentLogger: Logger) {
         }
 
         dtlsStack.remoteFingerprints = remoteFingerprints
-        val hasSha1Hash = remoteFingerprints.keys.any { it.equals("sha-1", ignoreCase = true) }
-        if (dtlsStack.role == null && hasSha1Hash) {
-            // hack(george) Jigasi sends a sha-1 dtls fingerprint without a
-            // setup attribute and it assumes a server role for the bridge.
-
-            logger.info("Assume that the remote side is Jigasi, we'll act as server")
-            dtlsStack.actAsServer()
-        }
     }
 
     /**
@@ -167,19 +214,23 @@ class DtlsTransport(parentLogger: Logger) {
         }
         fingerprintPE.fingerprint = dtlsStack.localFingerprint
         fingerprintPE.hash = dtlsStack.localFingerprintHashFunction
+        if (cryptex) {
+            fingerprintPE.cryptex = true
+        }
     }
+
+    fun enqueueBuffer(buffer: Buffer) = dtlsQueue.add(buffer)
 
     /**
      * Notify this layer that DTLS data has been received from the network
      */
-    fun dtlsDataReceived(data: ByteArray, off: Int, len: Int) =
+    private fun dtlsDataReceived(data: ByteArray, off: Int, len: Int) =
         dtlsStack.processIncomingProtocolData(data, off, len)
 
     /**
      * Send out DTLS data
      */
-    fun sendDtlsData(data: ByteArray, off: Int, len: Int) =
-        dtlsStack.sendApplicationData(data, off, len)
+    fun sendDtlsData(data: ByteArray, off: Int, len: Int) = dtlsStack.sendApplicationData(data, off, len)
 
     fun stop() {
         if (running.compareAndSet(true, false)) {
@@ -188,8 +239,9 @@ class DtlsTransport(parentLogger: Logger) {
         }
     }
 
-    fun getDebugState(): OrderedJsonObject = stats.toJson().apply {
+    fun getDebugState(): ObjectNode = stats.toJson().apply {
         put("running", running.get())
+        put("role", dtlsStack.role?.javaClass?.simpleName ?: "null")
         put("is_connected", isConnected)
     }
 
@@ -199,7 +251,7 @@ class DtlsTransport(parentLogger: Logger) {
         var numPacketsSent: Int = 0,
         var numOutgoingPacketsDroppedNoHandler: Int = 0
     ) {
-        fun toJson(): OrderedJsonObject = OrderedJsonObject().apply {
+        fun toJson(): ObjectNode = JsonNodeFactory.instance.objectNode().apply {
             put("num_packets_received", numPacketsReceived)
             put("num_incoming_packets_dropped_no_handler", numIncomingPacketsDroppedNoHandler)
             put("num_packets_sent", numPacketsSent)

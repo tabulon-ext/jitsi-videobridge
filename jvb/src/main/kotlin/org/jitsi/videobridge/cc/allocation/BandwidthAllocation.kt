@@ -15,6 +15,8 @@
  */
 package org.jitsi.videobridge.cc.allocation
 
+import com.fasterxml.jackson.databind.node.JsonNodeFactory
+import com.fasterxml.jackson.databind.node.ObjectNode
 import org.jitsi.nlj.MediaSourceDesc
 import org.jitsi.nlj.RtpLayerDesc
 
@@ -23,39 +25,61 @@ import org.jitsi.nlj.RtpLayerDesc
  */
 class BandwidthAllocation @JvmOverloads constructor(
     val allocations: Set<SingleAllocation>,
-    val oversending: Boolean = false
+    val oversending: Boolean = false,
+    val idealBps: Long = -1,
+    val targetBps: Long = -1,
+    /** Whether any of the requested sources were suspended (no layer at all was selected) due to BWE. */
+    private val suspendedSources: List<String> = emptyList()
 ) {
-    val forwardedEndpoints: Set<String> =
-        allocations.filter { it.isForwarded() }.map { it.endpointId }.toSet()
+    val hasSuspendedSources: Boolean = suspendedSources.isNotEmpty()
+
+    val forwardedSources: Set<String> =
+        allocations.filter { it.isForwarded() }.mapNotNull { it.mediaSource?.sourceName }.toSet()
 
     /**
-     * Whether the two allocations have the same endpoints and same layers.
+     * Whether the two allocations have the same endpoints and the same layers, of the same source objects with the
+     * same video types. A source which was removed and signaled again is a new object. The state the receive
+     * pipeline keeps on it, such as which encodings are being sent, is read through the object the allocation
+     * carries, so a new object is a change even when the layers chosen are the same.
      */
-    fun isTheSameAs(other: BandwidthAllocation) =
-        allocations.size == other.allocations.size &&
-            oversending == other.oversending &&
-            allocations.all { allocation ->
-                other.allocations.any { otherAllocation ->
-                    allocation.endpointId == otherAllocation.endpointId &&
-                        allocation.source?.primarySSRC == otherAllocation.source?.primarySSRC &&
-                        allocation.targetLayer?.index == otherAllocation.targetLayer?.index
-                }
+    fun isTheSameAs(other: BandwidthAllocation) = allocations.size == other.allocations.size &&
+        oversending == other.oversending &&
+        allocations.all { allocation ->
+            other.allocations.any { otherAllocation ->
+                allocation.endpointId == otherAllocation.endpointId &&
+                    allocation.mediaSource === otherAllocation.mediaSource &&
+                    allocation.mediaSource?.videoType == otherAllocation.mediaSource?.videoType &&
+                    allocation.targetLayer?.index == otherAllocation.targetLayer?.index
             }
-
-    /**
-     * Whether this allocation is forwarding a source from an endpoint with this ID.
-     */
-    fun isForwarding(epId: String): Boolean = forwardedEndpoints.contains(epId)
+        }
 
     override fun toString(): String = "oversending=$oversending " + allocations.joinToString()
+
+    val debugState: ObjectNode
+        get() = JsonNodeFactory.instance.objectNode().apply {
+            put("idealBps", idealBps)
+            put("targetBps", targetBps)
+            put("oversending", oversending)
+            put("has_suspended_sources", hasSuspendedSources)
+            put("suspended_sources", suspendedSources.toString())
+            val allocationsNode = JsonNodeFactory.instance.objectNode().apply {
+                allocations.forEach {
+                    val name = it.mediaSource?.sourceName ?: it.endpointId
+                    set<ObjectNode>(name, it.debugState)
+                }
+            }
+            set<ObjectNode>("allocations", allocationsNode)
+        }
 }
 
 /**
  * The result of bandwidth allocation for a specific endpoint and a [MediaSourceDesc].
  */
 data class SingleAllocation(
+    /** The ID of the endpoint which owns the media source */
     val endpointId: String,
-    val source: MediaSourceDesc? = null,
+    /** The media source */
+    val mediaSource: MediaSourceDesc?,
     /**
      * The layer which has been selected to be forwarded.
      */
@@ -65,13 +89,25 @@ data class SingleAllocation(
      */
     val idealLayer: RtpLayerDesc? = null
 ) {
+    constructor(endpoint: MediaSourceContainer, targetLayer: RtpLayerDesc? = null, idealLayer: RtpLayerDesc? = null) :
+        this(
+            endpoint.id,
+            endpoint.mediaSources.firstOrNull(),
+            targetLayer,
+            idealLayer
+        )
     private val targetIndex: Int
         get() = targetLayer?.index ?: -1
     fun isForwarded(): Boolean = targetIndex > -1
 
-    /**
-     * Exclude [source]
-     */
-    override fun toString(): String = "[id=$endpointId target=${targetLayer?.height}/${targetLayer?.frameRate} " +
-        "ideal=${idealLayer?.height}/${idealLayer?.frameRate}"
+    override fun toString(): String = "[epId=$endpointId sourceName=${mediaSource?.sourceName} " +
+        "target=${targetLayer?.height}/${targetLayer?.frameRate} " +
+        "(${targetLayer?.indexString()}) " +
+        "ideal=${idealLayer?.height}/${idealLayer?.frameRate} (${idealLayer?.indexString()})]"
+
+    val debugState: ObjectNode
+        get() = JsonNodeFactory.instance.objectNode().apply {
+            targetLayer?.debugState()?.let { set<ObjectNode>("target", it) } ?: put("target", null as String?)
+            idealLayer?.debugState()?.let { set<ObjectNode>("ideal", it) } ?: put("ideal", null as String?)
+        }
 }

@@ -111,6 +111,11 @@ class Vp9Frame internal constructor(
     val pictureId: Int,
 
     /**
+     * The PictureID index (PictureID plus cycles) of this frame.
+     */
+    val index: Long,
+
+    /**
      * The VP9 TL0PICIDX of the incoming VP9 frame that this instance refers to
      * (RFC7741).
      */
@@ -179,7 +184,12 @@ class Vp9Frame internal constructor(
     val effectiveSpatialLayer: Int
         get() = if (spatialLayer >= 0) spatialLayer else 0
 
-    constructor(packet: Vp9Packet) : this(
+    // Validate that the index matches the pictureId
+    init {
+        assert((index and 0x7fff).toInt() == pictureId)
+    }
+
+    constructor(packet: Vp9Packet, index: Long) : this(
         ssrc = packet.ssrc,
         timestamp = packet.timestamp,
         earliestKnownSequenceNumber = packet.sequenceNumber,
@@ -194,10 +204,12 @@ class Vp9Frame internal constructor(
         usesInterLayerDependency = packet.usesInterLayerDependency,
         isInterPicturePredicted = packet.isInterPicturePredicted,
         pictureId = packet.pictureId,
+        index = index,
         tl0PICIDX = packet.TL0PICIDX,
         isKeyframe = packet.isKeyframe,
         numSpatialLayers = packet.scalabilityStructureNumSpatial
     )
+
     /**
      * Remember another packet of this frame.
      * Note: this assumes every packet is received only once, i.e. a filter
@@ -246,9 +258,7 @@ class Vp9Frame internal constructor(
      * belongs to the same RTP stream as the frame that this instance refers to,
      * false otherwise.
      */
-    fun matchesSSRC(vp9Frame: Vp9Frame): Boolean {
-        return ssrc == vp9Frame.ssrc
-    }
+    fun matchesSSRC(vp9Frame: Vp9Frame): Boolean = ssrc == vp9Frame.ssrc
 
     /**
      * Determines whether the [VideoRtpPacket] that is specified as an
@@ -262,9 +272,7 @@ class Vp9Frame internal constructor(
      * argument is part of the VP9 picture that is represented by this
      * [Vp9Frame] instance, false otherwise.
      */
-    private fun matchesSSRC(pkt: VideoRtpPacket): Boolean {
-        return ssrc == pkt.ssrc
-    }
+    private fun matchesSSRC(pkt: VideoRtpPacket): Boolean = ssrc == pkt.ssrc
 
     /**
      * Checks whether the specified RTP packet is part of this frame.
@@ -273,10 +281,8 @@ class Vp9Frame internal constructor(
      * @return true if the specified RTP packet is part of this frame, false
      * otherwise.
      */
-    fun matchesFrame(pkt: Vp9Packet): Boolean {
-        return matchesSSRC(pkt) && timestamp == pkt.timestamp &&
-            spatialLayer == pkt.spatialLayerIndex
-    }
+    fun matchesFrame(pkt: Vp9Packet): Boolean = matchesSSRC(pkt) && timestamp == pkt.timestamp &&
+        spatialLayer == pkt.spatialLayerIndex
 
     /**
      * Validates that the specified RTP packet consistently matches all the
@@ -296,7 +302,8 @@ class Vp9Frame internal constructor(
             isUpperLevelReference == pkt.isUpperLevelReference &&
             usesInterLayerDependency == pkt.usesInterLayerDependency &&
             isInterPicturePredicted == pkt.isInterPicturePredicted
-        ) /* TODO: also check start, end, seq nums? */ {
+            // TODO: also check start, end, seq nums?
+        ) {
             return
         }
         throw RuntimeException(
@@ -381,8 +388,11 @@ class Vp9Frame internal constructor(
         return when {
             delta == 0 ->
                 spatialLayer == otherFrame.spatialLayer + 1
+
             delta == 1 ->
-                spatialLayer == 0 && otherFrame.spatialLayer == 2 /* ??? */
+                spatialLayer == 0 && otherFrame.spatialLayer == 2
+
+            // ???
             else ->
                 false
         }

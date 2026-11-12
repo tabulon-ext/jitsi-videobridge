@@ -15,16 +15,20 @@
  */
 package org.jitsi.videobridge.xmpp;
 
+import org.jetbrains.annotations.*;
 import org.jitsi.nlj.*;
 import org.jitsi.nlj.rtp.*;
+import org.jitsi.nlj.rtp.codec.vpx.*;
 import org.jitsi.utils.logging2.*;
 import org.jitsi.xmpp.extensions.colibri.*;
 import org.jitsi.xmpp.extensions.jingle.*;
 import org.jitsi.xmpp.extensions.jitsimeet.*;
+import org.jivesoftware.smack.packet.*;
 import org.jxmpp.jid.parts.*;
 import org.jxmpp.util.*;
 
 import java.util.*;
+import java.util.Objects;
 import java.util.stream.*;
 
 /**
@@ -38,16 +42,7 @@ public class MediaSourceFactory
      * The {@link Logger} used by the {@link MediaSourceDesc} class and its
      * instances for logging output.
      */
-    private static final Logger logger
-        = new LoggerImpl(MediaSourceFactory.class.getName());
-
-    /**
-     * The default number of temporal layers to use for VP8 simulcast.
-     *
-     * FIXME: hardcoded ugh.. this should be either signaled or somehow included
-     * in the RTP stream.
-     */
-    private static final int VP8_SIMULCAST_TEMPORAL_LAYERS = 3;
+    private static final Logger logger = new LoggerImpl(MediaSourceFactory.class.getName());
 
     /**
      * The resolution of the base stream when activating simulcast for VP8.
@@ -77,7 +72,7 @@ public class MediaSourceFactory
         return secondarySsrcTypeMap;
     }
 
-    private static final RtpLayerDesc[] noDependencies = new RtpLayerDesc[0];
+    private static final VpxRtpLayerDesc[] noDependencies = new VpxRtpLayerDesc[0];
 
     /*
      * Creates layers for an encoding.
@@ -90,8 +85,8 @@ public class MediaSourceFactory
     private static RtpLayerDesc[] createRTPLayerDescs(
         int spatialLen, int temporalLen, int encodingIdx, int height)
     {
-        RtpLayerDesc[] rtpLayers
-            = new RtpLayerDesc[spatialLen * temporalLen];
+        VpxRtpLayerDesc[] rtpLayers
+            = new VpxRtpLayerDesc[spatialLen * temporalLen];
 
         for (int spatialIdx = 0; spatialIdx < spatialLen; spatialIdx++)
         {
@@ -102,11 +97,11 @@ public class MediaSourceFactory
                 int idx = idx(spatialIdx, temporalIdx,
                     temporalLen);
 
-                RtpLayerDesc[] dependencies;
+                VpxRtpLayerDesc[] dependencies;
                 if (spatialIdx > 0 && temporalIdx > 0)
                 {
                     // this layer depends on spatialIdx-1 and temporalIdx-1.
-                    dependencies = new RtpLayerDesc[]{
+                    dependencies = new VpxRtpLayerDesc[]{
                         rtpLayers[
                             idx(spatialIdx, temporalIdx - 1,
                                 temporalLen)],
@@ -118,7 +113,7 @@ public class MediaSourceFactory
                 else if (spatialIdx > 0)
                 {
                     // this layer depends on spatialIdx-1.
-                    dependencies = new RtpLayerDesc[]
+                    dependencies = new VpxRtpLayerDesc[]
                         {rtpLayers[
                             idx(spatialIdx - 1, temporalIdx,
                                 temporalLen)]};
@@ -126,7 +121,7 @@ public class MediaSourceFactory
                 else if (temporalIdx > 0)
                 {
                     // this layer depends on temporalIdx-1.
-                    dependencies = new RtpLayerDesc[]
+                    dependencies = new VpxRtpLayerDesc[]
                         {rtpLayers[
                             idx(spatialIdx, temporalIdx - 1,
                                 temporalLen)]};
@@ -141,13 +136,11 @@ public class MediaSourceFactory
                 int spatialId = spatialLen > 1 ? spatialIdx : -1;
 
                 rtpLayers[idx]
-                    = new RtpLayerDesc(encodingIdx,
+                    = new VpxRtpLayerDesc(encodingIdx,
                     temporalId, spatialId, height, frameRate, dependencies);
 
                 frameRate *= 2;
             }
-
-
         }
         return rtpLayers;
     }
@@ -171,7 +164,7 @@ public class MediaSourceFactory
         RtpLayerDesc[] layers = createRTPLayerDescs(spatialLen, temporalLen,
             encodingIdx, height);
 
-        RtpEncodingDesc enc = new RtpEncodingDesc(primarySsrc, layers);
+        RtpEncodingDesc enc = new RtpEncodingDesc(primarySsrc, layers, encodingIdx);
 
         if (secondarySsrcs != null)
         {
@@ -334,7 +327,8 @@ public class MediaSourceFactory
      */
     private static List<SourceSsrcs> getSourceSsrcs(
             Collection<SourcePacketExtension> sources,
-            Collection<SourceGroupPacketExtension> sourceGroups)
+            Collection<SourceGroupPacketExtension> sourceGroups
+    )
     {
         //FIXME: determining the individual sources should be done via msid,
         // but somewhere along the line we seem to lose the msid information
@@ -394,11 +388,13 @@ public class MediaSourceFactory
             });
         });
 
-        if (!sourceGroupsCopy.isEmpty()) {
+        if (!sourceGroupsCopy.isEmpty())
+        {
             logger.warn(
                 "Unprocessed source groups: " +
                     sourceGroupsCopy.stream()
-                        .map(SourceGroupPacketExtension::toXML)
+                        .map(Element::toXML)
+                        .map(Object::toString)
                         .reduce(String::concat));
         }
 
@@ -423,7 +419,7 @@ public class MediaSourceFactory
             }
         });
 
-        setOwners(sources, sourceSsrcsList);
+        setOwnersAndNames(sources, sourceSsrcsList);
 
         return sourceSsrcsList;
     }
@@ -431,15 +427,16 @@ public class MediaSourceFactory
     /**
      * Updates the given list of {@link SourceSsrcs}, setting the {@code owner}
      * field according to the {@code owner} attribute in {@code ssrc-info}
-     * extensions contained in {@code sources}.
-     * @param sources the list of {@link SourcePacketExtension} which contain
+     * extensions contained in {@code sources}, if not specified externally
+     * @param sources the list of {@link SourcePacketExtension} which may contain
      * the {@code owner} as an attribute of a {@code ssrc-info} child. The
      * list or the objects in the list will not be modified.
      * @param sourceSsrcsList the list of {@link SourceSsrcs} to update.
      */
-    private static void setOwners(
+    private static void setOwnersAndNames(
         Collection<SourcePacketExtension> sources,
-        Collection<SourceSsrcs> sourceSsrcsList)
+        Collection<SourceSsrcs> sourceSsrcsList
+    )
     {
         for (SourceSsrcs sourceSsrcs : sourceSsrcsList)
         {
@@ -453,6 +450,7 @@ public class MediaSourceFactory
                     .findAny().orElse(null);
 
             sourceSsrcs.owner = getOwner(sourceSource);
+            sourceSsrcs.name = sourceSource != null ? sourceSource.getName() : null;
         }
     }
 
@@ -484,9 +482,6 @@ public class MediaSourceFactory
              *          .getResourceOrEmpty().toString();
              *
              * but avoids expensive construction of a lot of JID parts we just throw away.
-             *
-             * This function is called repeatedly by {@link ConfOctoTransport#setSources}
-             * so needs to be fast.
              */
             String ownerAttr = ssrcInfoPacketExtension.getAttributeAsString(SSRCInfoPacketExtension.OWNER_ATTR_NAME);
             if (ownerAttr != null)
@@ -524,19 +519,19 @@ public class MediaSourceFactory
      * source groups.
      * @return an array of {@link MediaSourceDesc} that are described in the
      * jingle sources and source groups.
+     * @deprecated Use createMediaSource.
      */
+    @Deprecated
     public static MediaSourceDesc[] createMediaSources(
         Collection<SourcePacketExtension> sources,
         Collection<SourceGroupPacketExtension> sourceGroups)
     {
         final Collection<SourceGroupPacketExtension> finalSourceGroups
                 = sourceGroups == null ? new ArrayList<>() : sourceGroups;
-        if (sources == null)
-        {
-            sources = new ArrayList<>();
-        }
+        final Collection<SourcePacketExtension> finalSources
+                = sources == null ? new ArrayList<>() : sources;
 
-        List<SourceSsrcs> sourceSsrcsList = getSourceSsrcs(sources, finalSourceGroups);
+        List<SourceSsrcs> sourceSsrcsList = getSourceSsrcs(finalSources, finalSourceGroups);
         List<MediaSourceDesc> mediaSources = new ArrayList<>();
 
         sourceSsrcsList.forEach(sourceSsrcs -> {
@@ -560,12 +555,88 @@ public class MediaSourceFactory
                         sourceSsrcs,
                         numSpatialLayersPerStream,
                         numTemporalLayersPerStream,
-                        secondarySsrcs);
+                        secondarySsrcs,
+                        sourceSsrcs.owner,
+                        sourceSsrcs.name,
+                        getVideoType(finalSources),
+                        false
+            );
             mediaSources.add(mediaSource);
         });
 
         return mediaSources.toArray(new MediaSourceDesc[0]);
     }
+
+    // This method is to replace createMediaSources when Colibri V1 is removed
+    public static MediaSourceDesc createMediaSource(
+            Collection<SourcePacketExtension> sources,
+            Collection<SourceGroupPacketExtension> sourceGroups,
+            String owner,
+            String name)
+    {
+        return createMediaSource(sources, sourceGroups, owner, name, false);
+    }
+
+    public static MediaSourceDesc createMediaSource(
+            Collection<SourcePacketExtension> sources,
+            Collection<SourceGroupPacketExtension> sourceGroups,
+            String owner,
+            String name,
+            boolean synthetic)
+    {
+        Objects.requireNonNull(owner, "owner is required");
+        Objects.requireNonNull(name, "name is required");
+
+        final Collection<SourceGroupPacketExtension> finalSourceGroups
+            = sourceGroups == null ? new ArrayList<>() : sourceGroups;
+        if (sources == null)
+        {
+            return null;
+        }
+
+        List<SourceSsrcs> sourceSsrcsList = getSourceSsrcs(sources, finalSourceGroups);
+
+        if (sourceSsrcsList.size() != 1)
+        {
+            logger.warn("sourceSsrcsList.size() != 1 for: " + sources + " groups: " + finalSourceGroups);
+        }
+
+        if (sourceSsrcsList.size() > 0)
+        {
+            SourceSsrcs sourceSsrcs = sourceSsrcsList.get(0);
+
+            // As of now, we only ever have 1 spatial layer per stream
+            int numSpatialLayersPerStream = 1;
+            // Previously, we assumed that when simulcast was enabled, 3 temporal layers would
+            // be present in each stream and if simulcast wasn't enabled, there would be only
+            // 1 temporal layer per stream, but we found that screenshare started sending 2
+            // temporal layers, and we'd therefore start dropping layer 1 packets since we didn't
+            // recognize them.  The truth is we have no way of _knowing_ how many temporal layers
+            // there are going to be (as it's not signaled) unless we dynamically read the layers
+            // as the packets come in (which we may want to do in the future)--but for now we'll
+            // over-estimate how many layers there are per stream to avoid dropping packets for a
+            // layer we don't recognize.  Since there are already situations where chrome sends fewer
+            // temporal layers than we assume, this should be safe.
+            final int numTemporalLayersPerStream = 3;
+            Map<Long, SecondarySsrcs> secondarySsrcs = getAllSecondarySsrcs(sourceSsrcs, finalSourceGroups);
+
+            return createSource(
+                    sourceSsrcs,
+                    numSpatialLayersPerStream,
+                    numTemporalLayersPerStream,
+                    secondarySsrcs,
+                    owner,
+                    name,
+                    getVideoType(sources),
+                    synthetic
+            );
+        }
+        else
+        {
+            return null;
+        }
+    }
+
 
     /**
      * Calculates the array position of an RTP layer description specified by its
@@ -636,6 +707,8 @@ public class MediaSourceFactory
     private static class SourceSsrcs
         implements Iterable<Long>
     {
+        private String name;
+
         private List<Long> sourceSsrcs;
 
         private String owner;
@@ -700,13 +773,20 @@ public class MediaSourceFactory
      * @param allSecondarySsrcs a map of primary ssrc -> SecondarySsrcs, which lists
      * the ssrc and type of all the secondary ssrcs for a given primary (e.g.
      * its corresponding rtx and fec ssrcs)
+     * @param owner An externally specified owner, if available.
+     * @param name An externally specified name, if available.
      * @return the created MediaSourceDesc
      */
     private static MediaSourceDesc createSource(
             SourceSsrcs primarySsrcs,
             int numSpatialLayersPerStream,
             int numTemporalLayersPerStream,
-            Map<Long, SecondarySsrcs> allSecondarySsrcs)
+            Map<Long, SecondarySsrcs> allSecondarySsrcs,
+            String owner,
+            String name,
+            VideoType videoType,
+            boolean synthetic
+    )
     {
         RtpEncodingDesc[] encodings =
             new RtpEncodingDesc[primarySsrcs.size()];
@@ -734,8 +814,27 @@ public class MediaSourceFactory
             height *= 2;
         }
 
-        MediaSourceDesc source = new MediaSourceDesc(encodings, primarySsrcs.owner);
+        if (name == null)
+        {
+            throw new IllegalArgumentException("The 'name' is missing in the source description");
+        }
+        if (owner == null)
+        {
+            throw new IllegalArgumentException("The 'owner' is missing in the source description");
+        }
 
-        return source;
+        return new MediaSourceDesc(encodings, owner, name, videoType, synthetic);
+    }
+
+    private static VideoType getVideoType(@NotNull Collection<SourcePacketExtension> sources)
+    {
+        for (SourcePacketExtension source : sources)
+        {
+            if (source.getVideoType() != null)
+            {
+                return VideoType.valueOf(source.getVideoType().toUpperCase());
+            }
+        }
+        return VideoType.CAMERA;
     }
 }

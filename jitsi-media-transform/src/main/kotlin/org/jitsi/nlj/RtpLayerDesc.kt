@@ -1,0 +1,282 @@
+/*
+ * Copyright @ 2018 - present 8x8, Inc.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.jitsi.nlj
+
+import com.fasterxml.jackson.databind.node.JsonNodeFactory
+import com.fasterxml.jackson.databind.node.ObjectNode
+import org.jitsi.nlj.transform.node.incoming.BitrateCalculator
+import org.jitsi.nlj.util.Bandwidth
+import org.jitsi.nlj.util.BitrateTracker
+import org.jitsi.nlj.util.DataSize
+
+/**
+ * Keeps track of its subjective quality index,
+ * its last stable bitrate and other useful things for adaptivity/routing.
+ *
+ * @author George Politis
+ */
+abstract class RtpLayerDesc(
+    /**
+     * The index of this instance's encoding in the source encoding array.
+     */
+    val eid: Int,
+    /**
+     * The temporal layer ID of this instance.
+     */
+    val tid: Int,
+    /**
+     * The spatial layer ID of this instance.
+     */
+    val sid: Int,
+    /**
+     * The max "height" of the bitstream that this instance represents. The actual
+     * height may be less due to bad network or system load.  [NO_HEIGHT] for unknown.
+     *
+     * In order to handle portrait-mode video correctly, this should actually be the smaller of
+     * the bitstream's height or width.
+     *
+     * Where possible we sniff the actual height from the RTP packets. Written on the receive pipeline's thread, by
+     * the codec parsers and the VLA reader, and read by the bandwidth allocators on their own threads.
+     */
+    @Volatile
+    var height: Int,
+    /**
+     * The max frame rate (in fps) of the bitstream that this instance
+     * represents. The actual frame rate may be less due to bad network or
+     * system load.  [NO_FRAME_RATE] for unknown.
+     */
+    var frameRate: Double,
+) {
+    abstract fun copy(height: Int = this.height, tid: Int = this.tid, inherit: Boolean = true): RtpLayerDesc
+
+    /**
+     * The [BitrateTracker] instance used to calculate the receiving bitrate of this RTP layer.
+     */
+    protected var bitrateTracker = BitrateCalculator.createBitrateTracker()
+
+    /**
+     * A second [BitrateTracker] with a longer window, for sources whose bitrate is bursty. It is only created once
+     * [enableSmoothedBitrate] is called, because it costs memory per layer and an update per packet per layer, and
+     * only screen sharing sources use it. See [BitrateCalculator.createSmoothedBitrateTracker].
+     *
+     * Volatile because it is enabled from the threads which run bandwidth allocation (one per receiver, so possibly
+     * several at once), but read and updated from the thread which reads packets.
+     */
+    @Volatile
+    private var smoothedBitrateTracker: BitrateTracker? = null
+
+    /**
+     * The [clock] time at which [smoothedBitrateTracker] was created. Only meaningful while the tracker is non-null.
+     * Writes to it are made visible by the subsequent volatile write to [smoothedBitrateTracker].
+     */
+    private var smoothedBitrateTrackerCreatedMs: Long = -1
+
+    /**
+     * Start tracking a smoothed bitrate for this layer. Idempotent. Until the tracker created here has a full window
+     * of history, [getSmoothedBitrate] falls back to [getBitrate], so that a source is not priced at close to zero
+     * while the longer window fills up.
+     */
+    fun enableSmoothedBitrate(nowMs: Long) {
+        if (smoothedBitrateTracker == null) {
+            synchronized(this) {
+                if (smoothedBitrateTracker == null) {
+                    smoothedBitrateTrackerCreatedMs = nowMs
+                    smoothedBitrateTracker = BitrateCalculator.createSmoothedBitrateTracker()
+                }
+            }
+        }
+    }
+
+    /**
+     * Stop tracking a smoothed bitrate for this layer, dropping the tracker and its history. Called when the source
+     * stops being bursty (e.g. a screen share reverting to camera), so that the layer stops paying for the tracker,
+     * and so that a later re-enable does not price the source from the previous mode's traffic.
+     */
+    fun disableSmoothedBitrate() {
+        if (smoothedBitrateTracker != null) {
+            synchronized(this) {
+                smoothedBitrateTracker = null
+            }
+        }
+    }
+
+    /**
+     * The rate of this layer alone, either over the estimator-matched window or over the longer window used for
+     * bursty sources. The smoothed rate falls back to the other one while it is not being tracked, and while its
+     * tracker does not yet have a full window of history (since it always divides by the full window, a young tracker
+     * would under-report the rate, in the extreme pricing the source at zero at the moment it is enabled).
+     */
+    protected fun layerRate(nowMs: Long, smoothed: Boolean): Bandwidth {
+        val smoothedTracker = if (smoothed) smoothedBitrateTracker else null
+        return if (smoothedTracker != null && nowMs - smoothedBitrateTrackerCreatedMs >= smoothedWindowMs) {
+            smoothedTracker.getRateOverFullWindow(nowMs)
+        } else {
+            bitrateTracker.getRate(nowMs)
+        }
+    }
+
+    var targetBitrate: Bandwidth? = null
+
+    /**
+     * @return the "id" of this layer within this encoding. This is a server-side id and should
+     * not be confused with any encoding id defined in the client (such as the
+     * rid).
+     */
+    abstract val layerId: Int
+
+    /**
+     * A local index of this track.
+     */
+    abstract val index: Int
+
+    /**
+     * Inherit a [BitrateTracker] object
+     */
+    internal fun inheritStatistics(tracker: BitrateTracker) {
+        bitrateTracker = tracker
+    }
+
+    /**
+     * Inherit another layer description's [BitrateTracker] object.
+     */
+    internal open fun inheritFrom(other: RtpLayerDesc) {
+        inheritStatistics(other.bitrateTracker)
+        // Only take the other layer's smoothed tracker if it has one: layer arrays are replaced whenever the
+        // scalability structure is re-signaled, and dropping an established tracker would restart its window.
+        other.smoothedBitrateTracker?.let {
+            smoothedBitrateTrackerCreatedMs = other.smoothedBitrateTrackerCreatedMs
+            smoothedBitrateTracker = it
+        }
+        targetBitrate = other.targetBitrate
+    }
+
+    /**
+     *
+     * @param packetSize
+     * @param nowMs
+     * @return true if this caused the rate being tracked to transition from zero to nonzero
+     */
+    fun updateBitrate(packetSize: DataSize, nowMs: Long): Boolean {
+        val wasInactive = hasZeroBitrate(nowMs)
+        // Update rate stats (this should run after padding termination).
+        bitrateTracker.update(packetSize, nowMs)
+        smoothedBitrateTracker?.update(packetSize, nowMs)
+        return wasInactive && packetSize.bits > 0L
+    }
+
+    /**
+     * Gets the cumulative bitrate (in bps) of this [RtpLayerDesc] and its dependencies.
+     *
+     * @param nowMs
+     * @return the cumulative bitrate (in bps) of this [RtpLayerDesc] and its dependencies.
+     */
+    abstract fun getBitrate(nowMs: Long): Bandwidth
+
+    /**
+     * Like [getBitrate], but measured over the longer window of [smoothedBitrateTracker]. Used for sources whose
+     * bitrate is bursty, where the instantaneous rate over-states the bandwidth the source needs.
+     */
+    abstract fun getSmoothedBitrate(nowMs: Long): Bandwidth
+
+    /**
+     * Recursively checks this layer and its dependencies to see if the bitrate is zero.
+     * Note that unlike [calcBitrate] this does not avoid double-visiting layers; the overhead
+     * of the hash table is usually more than the cost of any double-visits.
+     */
+    abstract fun hasZeroBitrate(nowMs: Long): Boolean
+
+    open fun debugState(): ObjectNode = JsonNodeFactory.instance.objectNode().apply {
+        put("frameRate", frameRate)
+        put("height", height)
+        put("index", index)
+        put("bitrate_bps", getBitrate(System.currentTimeMillis()).bps)
+        put("smoothed_bitrate_bps", getSmoothedBitrate(System.currentTimeMillis()).bps)
+        put("target_bitrate", targetBitrate?.bps ?: 0)
+        put("indexString", indexString())
+    }
+
+    abstract fun indexString(): String
+
+    companion object {
+        /** The length of the smoothed trackers' window, cached (it is fixed by configuration). */
+        private val smoothedWindowMs: Long by lazy { BitrateCalculator.smoothedWindowSize.toMillis() }
+
+        /**
+         * The index value that is used to represent that forwarding is suspended.
+         */
+        const val SUSPENDED_INDEX = -1
+
+        /**
+         * The encoding ID value that is used to represent that forwarding is suspended.
+         */
+        const val SUSPENDED_ENCODING_ID = -1
+
+        /**
+         * A value used to designate the absence of height information.
+         */
+        const val NO_HEIGHT = -1
+
+        /**
+         * A value used to designate the absence of frame rate information.
+         */
+        const val NO_FRAME_RATE = -1.0
+
+        /**
+         * Calculate the "index" of a layer based on its encoding, spatial, and temporal ID.
+         * This is a server-side id and should not be confused with any encoding id defined
+         * in the client (such as the rid) or the encodingId.  This is used by the videobridge's
+         * adaptive source projection for filtering.
+         */
+        @JvmStatic
+        fun getIndex(eid: Int, sid: Int, tid: Int): Int {
+            val e = if (eid < 0) 0 else eid
+            val s = if (sid < 0) 0 else sid
+            val t = if (tid < 0) 0 else tid
+
+            return (e shl 6) or (s shl 3) or t
+        }
+
+        /**
+         * Get an encoding ID from a layer index.  If the index is [SUSPENDED_INDEX],
+         * [SUSPENDED_ENCODING_ID] will be returned.
+         */
+        @JvmStatic
+        fun getEidFromIndex(index: Int) = index shr 6
+
+        /**
+         * Get a spatial ID from a layer index.  If the index is [SUSPENDED_INDEX],
+         * the value is unspecified.
+         */
+        @JvmStatic
+        fun getSidFromIndex(index: Int) = (index and 0x38) shr 3
+
+        /**
+         * Get a temporal ID from a layer index.  If the index is [SUSPENDED_INDEX],
+         * the value is unspecified.
+         */
+        @JvmStatic
+        fun getTidFromIndex(index: Int) = index and 0x7
+
+        /**
+         * Get a string description of a layer index.
+         */
+        fun indexString(index: Int): String = if (index == SUSPENDED_INDEX) {
+            "SUSP"
+        } else {
+            "E${getEidFromIndex(index)}S${getSidFromIndex(index)}T${getTidFromIndex(index)}"
+        }
+    }
+}

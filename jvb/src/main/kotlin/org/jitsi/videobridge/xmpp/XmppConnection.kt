@@ -16,24 +16,30 @@
 
 package org.jitsi.videobridge.xmpp
 
+import com.fasterxml.jackson.databind.node.ArrayNode
+import com.fasterxml.jackson.databind.node.JsonNodeFactory
+import com.fasterxml.jackson.databind.node.ObjectNode
 import org.jitsi.nlj.stats.DelayStats
-import org.jitsi.nlj.util.OrderedJsonObject
 import org.jitsi.utils.logging2.cdebug
 import org.jitsi.utils.logging2.createLogger
-import org.jitsi.videobridge.xmpp.config.XmppClientConnectionConfig
-import org.jitsi.xmpp.extensions.colibri.ColibriConferenceIQ
-import org.jitsi.xmpp.extensions.colibri.ShutdownIQ
+import org.jitsi.videobridge.colibri2.toRedactedXml
+import org.jitsi.videobridge.metrics.VideobridgeMetrics
+import org.jitsi.videobridge.metrics.VideobridgeMetricsContainer
+import org.jitsi.videobridge.xmpp.config.XmppClientConnectionConfig.Companion.config
+import org.jitsi.xmpp.extensions.colibri.ForcefulShutdownIQ
+import org.jitsi.xmpp.extensions.colibri.GracefulShutdownIQ
+import org.jitsi.xmpp.extensions.colibri2.ConferenceModifyIQ
 import org.jitsi.xmpp.extensions.health.HealthCheckIQ
+import org.jitsi.xmpp.mucclient.ConnectionStateListener
 import org.jitsi.xmpp.mucclient.IQListener
 import org.jitsi.xmpp.mucclient.MucClient
 import org.jitsi.xmpp.mucclient.MucClientConfiguration
 import org.jitsi.xmpp.mucclient.MucClientManager
-import org.jitsi.xmpp.util.IQUtils
+import org.jitsi.xmpp.util.createError
 import org.jivesoftware.smack.packet.ExtensionElement
 import org.jivesoftware.smack.packet.IQ
-import org.jivesoftware.smack.packet.XMPPError
+import org.jivesoftware.smack.packet.StanzaError
 import org.jivesoftware.smackx.iqversion.packet.Version
-import org.json.simple.JSONObject
 import java.util.concurrent.atomic.AtomicBoolean
 
 /**
@@ -47,8 +53,6 @@ class XmppConnection : IQListener {
      */
     val mucClientManager = MucClientManager(FEATURES)
 
-    val config = XmppClientConnectionConfig()
-
     private val running = AtomicBoolean(false)
 
     var eventHandler: EventHandler? = null
@@ -57,15 +61,23 @@ class XmppConnection : IQListener {
         if (running.compareAndSet(false, true)) {
             mucClientManager.apply {
                 registerIQ(HealthCheckIQ())
-                // Colibri IQs are handled async.
-                registerIQ(ColibriConferenceIQ(), false)
                 registerIQ(Version())
-                registerIQ(ShutdownIQ.createForceShutdownIQ())
-                registerIQ(ShutdownIQ.createGracefulShutdownIQ())
+                registerIQ(ForcefulShutdownIQ())
+                registerIQ(GracefulShutdownIQ())
+                registerIQ(ConferenceModifyIQ.ELEMENT, ConferenceModifyIQ.NAMESPACE, false)
                 setIQListener(this@XmppConnection)
+                addConnectionStateListener(object : ConnectionStateListener {
+                    override fun connected(mucClient: MucClient) {}
+                    override fun closed(mucClient: MucClient) = VideobridgeMetrics.xmppDisconnects.inc()
+                    override fun closedOnError(mucClient: MucClient) = VideobridgeMetrics.xmppDisconnects.inc()
+                    override fun reconnecting(mucClient: MucClient) {}
+                    override fun reconnectionFailed(mucClient: MucClient) {}
+                    override fun pingFailed(mucClient: MucClient) {}
+                })
             }
 
             config.clientConfigs.forEach { cfg -> mucClientManager.addMucClient(cfg) }
+            org.jitsi.videobridge.metrics.Metrics.metricsUpdater.addUpdateTask { updateMetrics() }
         } else {
             logger.info("Already started")
         }
@@ -75,6 +87,13 @@ class XmppConnection : IQListener {
         if (running.compareAndSet(true, false)) {
             mucClientManager.stop()
         }
+    }
+
+    fun updateMetrics() {
+        mucClientsConfigured.set(mucClientManager.clientCount)
+        mucClientsConnected.set(mucClientManager.clientConnectedCount)
+        mucsConfigured.set(mucClientManager.mucCount)
+        mucsJoined.set(mucClientManager.mucJoinedCount)
     }
 
     /**
@@ -105,28 +124,55 @@ class XmppConnection : IQListener {
      * is in the required format and either a new {@link MucClient} was added
      * or a client with the same ID already existed).
      */
-    fun addMucClient(jsonObject: JSONObject): Boolean {
-        if (jsonObject["id"] !is String) {
+    fun addMucClient(jsonObject: ObjectNode): Boolean {
+        val idNode = jsonObject.get("id")
+        if (idNode == null || !idNode.isTextual) {
             return false
         }
-        val config = MucClientConfiguration(jsonObject["id"] as String)
-        for (key in jsonObject.keys) {
-            val value = jsonObject[key]
-            if (key is String && value is String && key != "id") {
-                config.setProperty(key, value)
+        val config = MucClientConfiguration(idNode.asText())
+        jsonObject.fields().forEach { (key, value) ->
+            if (value.isTextual && key != "id") {
+                config.setProperty(key, value.asText())
             }
         }
         if (!config.isComplete) {
             logger.info("Not adding a MucClient, configuration incomplete.")
             return false
-        } else {
-            mucClientManager.addMucClient(config)
         }
 
-        // We consider the case where a client with the given ID already
-        // exists as success. Note however, that the existing client's
-        // configuration was NOT modified.
+        mucClientManager.getMucClient(config.id)?.let { existingMucClient ->
+            if (!existingMucClient.config.matches(config)) {
+                logger.warn(
+                    "Config for ${config.id} has changed, removing the old MucClient. Existing " +
+                        "config=${existingMucClient.config}, new config=$config"
+                )
+                mucClientManager.removeMucClient(config.id)
+            } else {
+                logger.info(
+                    "Ignoring request to add a MucClient that matches an existing one. Existing " +
+                        "config=${existingMucClient.config}, new config=$config"
+                )
+            }
+        }
+
+        logger.info("Adding MucClient for ${config.id}")
+        mucClientManager.addMucClient(config)
         return true
+    }
+
+    private fun MucClientConfiguration.matches(other: MucClientConfiguration) = hostname == other.hostname &&
+        port == other.port &&
+        domain == other.domain &&
+        username == other.username
+
+    /**
+     * Returns ids of [MucClient] that have been added.
+     * @return JSON string of the list of ids
+     */
+    fun getMucClientIds(): String {
+        val arr: ArrayNode = JsonNodeFactory.instance.arrayNode()
+        mucClientManager.mucClientIds.forEach { arr.add(it) }
+        return arr.toString()
     }
 
     /**
@@ -145,11 +191,14 @@ class XmppConnection : IQListener {
      * the expected format, or if no MUC client with the specified ID exists),
      * returns {@code false}.
      */
-    fun removeMucClient(jsonObject: JSONObject): Boolean {
-        if (jsonObject["id"] !is String) {
+    fun removeMucClient(jsonObject: ObjectNode): Boolean {
+        val idNode = jsonObject.get("id")
+        if (idNode == null || !idNode.isTextual) {
+            logger.info("Invalid ID: $idNode")
             return false
         }
-        return mucClientManager.removeMucClient(jsonObject["id"] as String)
+        logger.info("Removing muc client ${idNode.asText()}")
+        return mucClientManager.removeMucClient(idNode.asText())
     }
 
     /**
@@ -159,41 +208,49 @@ class XmppConnection : IQListener {
         if (iq == null) {
             return null
         }
-        logger.cdebug { "RECV: ${iq.toXML()}" }
+        // colibri2 requests are logged at the conference level.
+        if (iq !is ConferenceModifyIQ) {
+            logger.cdebug { "RECV: ${iq.toXML()}" }
+        }
 
         return when (iq.type) {
-            IQ.Type.get, IQ.Type.set -> handleIqRequest(iq, mucClient).also {
-                logger.cdebug { "SENT: ${it?.toXML() ?: "null"}" }
+            IQ.Type.get, IQ.Type.set -> handleIqRequest(iq, mucClient)?.also {
+                logger.cdebug { "SENT: ${it.toXML()}" }
             }
+
             else -> null
         }
     }
 
     private fun handleIqRequest(iq: IQ, mucClient: MucClient): IQ? {
-        val handler = eventHandler ?: return IQUtils.createError(
+        val handler = eventHandler ?: return createError(
             iq,
-            XMPPError.Condition.service_unavailable,
+            StanzaError.Condition.service_unavailable,
             "Service unavailable"
         )
         val response = when (iq) {
             is Version -> measureDelay(versionDelayStats, { iq.toXML() }) {
                 handler.versionIqReceived(iq)
             }
-            is ColibriConferenceIQ -> {
+
+            is ConferenceModifyIQ -> {
                 // Colibri IQs are handled async.
-                handler.colibriConferenceIqReceived(
+                handler.colibriRequestReceived(
                     ColibriRequest(iq, colibriDelayStats, colibriProcessingDelayStats) { response ->
-                        mucClient.sendStanza(response.setResponseTo(iq))
+                        response.setResponseTo(iq)
+                        mucClient.sendStanza(response)
                     }
                 )
                 null
             }
+
             is HealthCheckIQ -> measureDelay(healthDelayStats, { iq.toXML() }) {
                 handler.healthCheckIqReceived(iq)
             }
-            else -> IQUtils.createError(
+
+            else -> createError(
                 iq,
-                XMPPError.Condition.service_unavailable,
+                StanzaError.Condition.service_unavailable,
                 "Unsupported IQ request ${iq.childElementName}"
             )
         }
@@ -219,7 +276,7 @@ class XmppConnection : IQListener {
     }
 
     interface EventHandler {
-        fun colibriConferenceIqReceived(request: ColibriRequest)
+        fun colibriRequestReceived(request: ColibriRequest)
         fun versionIqReceived(iq: Version): IQ
         fun healthCheckIqReceived(iq: HealthCheckIQ): IQ
     }
@@ -228,7 +285,7 @@ class XmppConnection : IQListener {
         /**
          * The IQ which was received.
          */
-        val request: ColibriConferenceIQ,
+        val request: ConferenceModifyIQ,
         /**
          * The [DelayStats] instance which is to be updated with the total time it took to handle the request
          * (including queueing delay).
@@ -244,30 +301,52 @@ class XmppConnection : IQListener {
          * The callback to use to send the response.
          */
         val callback: (IQ) -> Unit
-    )
+    ) {
+        /**
+         * The request as XML for log lines, redacted as configured. Computed once and shared by every log line
+         * about this request.
+         */
+        val redactedXml: String by lazy { request.toRedactedXml() }
+    }
 
     companion object {
         private val FEATURES = arrayOf(
-            ColibriConferenceIQ.NAMESPACE,
             HealthCheckIQ.NAMESPACE,
             "urn:xmpp:jingle:apps:dtls:0",
             "urn:xmpp:jingle:transports:ice-udp:1",
             Version.NAMESPACE
         )
 
-        private val delayThresholds = longArrayOf(5, 50, 100, 1000)
+        private val delayThresholds = listOf(0, 5, 50, 100, 1000, Long.MAX_VALUE)
 
         private val colibriProcessingDelayStats = DelayStats(delayThresholds)
         private val colibriDelayStats = DelayStats(delayThresholds)
         private val healthDelayStats = DelayStats(delayThresholds)
         private val versionDelayStats = DelayStats(delayThresholds)
 
+        val mucClientsConfigured = VideobridgeMetricsContainer.instance.registerLongGauge(
+            "muc_clients_configured",
+            "Number of MUC clients that are configured."
+        )
+        val mucClientsConnected = VideobridgeMetricsContainer.instance.registerLongGauge(
+            "muc_clients_connected",
+            "Number of MUC clients that are connected."
+        )
+        val mucsConfigured = VideobridgeMetricsContainer.instance.registerLongGauge(
+            "mucs_connected",
+            "Number of MUCs that are configured."
+        )
+        val mucsJoined = VideobridgeMetricsContainer.instance.registerLongGauge(
+            "mucs_joined",
+            "Number of MUCs that are joined."
+        )
+
         @JvmStatic
-        fun getStatsJson(): OrderedJsonObject = OrderedJsonObject().apply {
-            put("colibri", colibriDelayStats.toJson())
-            put("colibri_processing", colibriProcessingDelayStats.toJson())
-            put("health", healthDelayStats.toJson())
-            put("version", versionDelayStats.toJson())
+        fun getStatsJson(): ObjectNode = JsonNodeFactory.instance.objectNode().apply {
+            set<ObjectNode>("colibri", colibriDelayStats.toJson())
+            set<ObjectNode>("colibri_processing", colibriProcessingDelayStats.toJson())
+            set<ObjectNode>("health", healthDelayStats.toJson())
+            set<ObjectNode>("version", versionDelayStats.toJson())
         }
     }
 }

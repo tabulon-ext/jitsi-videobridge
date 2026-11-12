@@ -20,17 +20,12 @@ Returns the currently running version.
 GET /about/version
 ```
 
-### List conferences
-Returns a list of running conferences.
+### Get Dominant speaker
+Returns a dominant speaker identification
 ```
-GET /colibri/conferences
+GET /colibri/v2/conferences/{meetingId}/dominant-speaker-identification
 ```
 
-### Describe a conference
-Returns the COLIBRI description of a conference.
-```
-GET /colibri/conferences/<CONFERENCE_ID>
-```
 
 ### Overall statistics
 Returns overall bridge statistics. These include number of current and total conferences and endpoints, number of packets/bytes received/sent, current packet rate and bit rate. They are generally suitable for storing as timeseries in order to monitor a service.
@@ -68,7 +63,7 @@ GET /debug/CONFERENCE_ID/ENDPOINT_ID
 ```
 
 
-# Global debug options
+# Global debug options and statistic features
 These are features that affect the entire bridge (as opposed to a single endpoint or conference).
 
 ### Payload verification
@@ -77,17 +72,17 @@ This is very CPU intensive and disabled by default (it is only useful for testin
 
 Enable:
 ```
-POST /debug/features/jvb/payload-verification/true
+POST /debug/stats/jvb/payload-verification/true
 ```
 
 Disable:
 ```
-POST /debug/features/jvb/payload-verification/false
+POST /debug/stats/jvb/payload-verification/false
 ```
 
 Query:
 ```
-GET /debug/features/jvb/payload-verification
+GET /debug/stats/jvb/payload-verification
 ```
 
 ### Pipeline statistics
@@ -99,16 +94,16 @@ only when endpoints expire.
 
 Enable:
 ```
-POST /debug/features/jvb/node-stats/true
+POST /debug/stats/jvb/node-stats/true
 ```
 
 Disable:
 ```
-POST /debug/features/jvb/node-stats/false
+POST /debug/stats/jvb/node-stats/false
 ```
 Query:
 ```
-GET /debug/features/jvb/node-stats
+GET /debug/stats/jvb/node-stats
 ```
 
 ### Memory pool statistics
@@ -116,16 +111,16 @@ These include current size, number of requests, allocation rates, etc. for the a
 
 Enable:
 ```
-POST /debug/features/jvb/pool-stats/true
+POST /debug/stats/jvb/pool-stats/true
 ```
 
 Disable:
 ```
-POST /debug/features/jvb/pool-stats/false
+POST /debug/stats/jvb/pool-stats/false
 ```
 Query:
 ```
-GET /debug/features/jvb/pool-stats
+GET /debug/stats/jvb/pool-stats
 ```
 
 ### Packet queue statistics
@@ -134,17 +129,17 @@ various packet queues. It is enabled by default.
 
 Enable:
 ```
-POST /debug/features/jvb/queue-stats/true
+POST /debug/stats/jvb/queue-stats/true
 ```
 
 Disable:
 ```
-POST /debug/features/jvb/queue-stats/false
+POST /debug/stats/jvb/queue-stats/false
 ```
 
 Query:
 ```
-GET /debug/features/jvb/queue-stats
+GET /debug/stats/jvb/queue-stats
 ```
 
 ### Packet transit time statistics
@@ -154,7 +149,7 @@ is always enabled.
 
 Query:
 ```
-GET /debug/features/jvb/transit-stats
+GET /debug/stats/jvb/transit-stats
 ```
 
 ### Task pool stats
@@ -163,7 +158,7 @@ It is always enabled.
 
 Query:
 ```
-GET /debug/features/jvb/task-pool-stats
+GET /debug/stats/jvb/task-pool-stats
 ```
 
 ### XMPP Delay stats
@@ -171,7 +166,7 @@ This keeps track of the response time for requests received over XMPP.
 
 Query:
 ```
-GET /debug/features/jvb/xmpp-delay-stats
+GET /debug/stats/jvb/xmpp-delay-stats
 ```
 
 ### Node tracing
@@ -179,16 +174,15 @@ This adds an entry to the stack trace from each Node in the packet processing pi
 
 Enable:
 ```
-POST /debug/features/jvb/node-tracing/true
-```
+POST /debug/stats/jvb/node-tracing/true
 ```
 
 Disable:
 ```
-POST /debug/features/jvb/node-tracing/false
+POST /debug/stats/jvb/node-tracing/false
 ```
 
-# Endpoint-specific debug options
+# Endpoint-specific debug options and features
 These are features that can be enabled for a specific endpoint in a specific conference.
 
 ### Saving RTP/RTCP in PCAP
@@ -205,4 +199,3 @@ Disable:
 ```
 POST /debug/features/endpoint/CONFERENCE_ID/ENDPOINT_ID/pcap-dump/false
 ```
-

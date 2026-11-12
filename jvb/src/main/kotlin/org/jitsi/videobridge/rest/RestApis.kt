@@ -18,7 +18,10 @@ package org.jitsi.videobridge.rest
 enum class RestApis {
     COLIBRI,
     DEBUG,
+    DRAIN,
     HEALTH,
+    PROMETHEUS,
+    RTCSTATS,
     SHUTDOWN,
     VERSION
 }

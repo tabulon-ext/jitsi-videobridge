@@ -18,15 +18,17 @@ package org.jitsi.videobridge.cc.vp8;
 import org.jetbrains.annotations.*;
 import org.jitsi.nlj.*;
 import org.jitsi.nlj.codec.vpx.*;
-import org.jitsi.nlj.format.*;
 import org.jitsi.nlj.rtp.codec.vp8.*;
 import org.jitsi.rtp.rtcp.*;
 import org.jitsi.rtp.util.*;
 import org.jitsi.utils.logging.*;
 import org.jitsi.utils.logging2.Logger;
 import org.jitsi.videobridge.cc.*;
-import org.json.simple.*;
+import com.fasterxml.jackson.databind.node.ArrayNode;
+import com.fasterxml.jackson.databind.node.JsonNodeFactory;
+import com.fasterxml.jackson.databind.node.ObjectNode;
 
+import java.time.*;
 import java.util.*;
 
 /**
@@ -66,29 +68,18 @@ public class VP8AdaptiveSourceProjectionContext
     private VP8FrameProjection lastVP8FrameProjection;
 
     /**
-     * The VP8 media format. No essential functionality relies on this field,
-     * it's only used as a cache of the {@link PayloadType} instance for VP8 in
-     * case we have to do a context switch (see {@link AdaptiveSourceProjection}),
-     * in order to avoid having to resolve the format.
-     */
-    private final PayloadType payloadType;
-
-    /**
      * Ctor.
      *
-     * @param payloadType the VP8 media format.
      * @param rtpState the RTP state to begin with.
      */
     public VP8AdaptiveSourceProjectionContext(
             @NotNull DiagnosticContext diagnosticContext,
-            @NotNull PayloadType payloadType,
             @NotNull RtpState rtpState,
             @NotNull Logger parentLogger)
     {
         this.diagnosticContext = diagnosticContext;
         this.logger = parentLogger.createChildLogger(
             VP8AdaptiveSourceProjectionContext.class.getName());
-        this.payloadType = payloadType;
         this.vp8QualityFilter = new VP8QualityFilter(parentLogger);
 
         lastVP8FrameProjection = new VP8FrameProjection(diagnosticContext,
@@ -262,14 +253,14 @@ public class VP8AdaptiveSourceProjectionContext
     /**
      * Determines whether a packet should be accepted or not.
      *
-     * @param packetInfo the RTP packet to determine whether to project or not.
-     * @param incomingIndex the quality index of the incoming RTP packet
+     * @param packetInfo  the RTP packet to determine whether to project or not.
      * @param targetIndex the target quality index we want to achieve
+     * @param liveness which encodings of the source the sender is currently sending.
      * @return true if the packet should be accepted, false otherwise.
      */
     @Override
     public synchronized boolean accept(
-        @NotNull PacketInfo packetInfo, int incomingIndex, int targetIndex)
+        @NotNull PacketInfo packetInfo, int targetIndex, @NotNull EncodingLiveness liveness)
     {
         if (!(packetInfo.getPacket() instanceof Vp8Packet))
         {
@@ -277,6 +268,7 @@ public class VP8AdaptiveSourceProjectionContext
             return false;
         }
         Vp8Packet vp8Packet = packetInfo.packetAs();
+        int incomingEncoding = vp8Packet.getEncodingId();
 
         VP8FrameMap.FrameInsertionResult result = insertPacketInMap(vp8Packet);
 
@@ -305,9 +297,9 @@ public class VP8AdaptiveSourceProjectionContext
                 }
             }
 
-            long receivedMs = packetInfo.getReceivedTime();
+            Instant receivedTime = packetInfo.getReceivedTime();
             boolean accepted = vp8QualityFilter
-                .acceptFrame(frame, incomingIndex, targetIndex, receivedMs);
+                .acceptFrame(frame, incomingEncoding, targetIndex, receivedTime, liveness);
 
             if (accepted)
             {
@@ -322,7 +314,7 @@ public class VP8AdaptiveSourceProjectionContext
                 try
                 {
                     projection = createProjection(frame, vp8Packet, result.isReset(),
-                        receivedMs);
+                        receivedTime);
                 }
                 catch (Exception e)
                 {
@@ -394,19 +386,19 @@ public class VP8AdaptiveSourceProjectionContext
         @NotNull VP8Frame frame,
         @NotNull Vp8Packet initialPacket,
         boolean isReset,
-        long receivedMs)
+        @Nullable Instant receivedTime)
     {
         if (frameIsNewSsrc(frame))
         {
-            return createLayerSwitchProjection(frame, initialPacket, receivedMs);
+            return createLayerSwitchProjection(frame, initialPacket, receivedTime);
         }
 
         else if (isReset)
         {
-            return createResetProjection(frame, initialPacket, receivedMs);
+            return createResetProjection(frame, initialPacket, receivedTime);
         }
 
-        return createInLayerProjection(frame, initialPacket, receivedMs);
+        return createInLayerProjection(frame, initialPacket, receivedTime);
     }
 
     /**
@@ -416,7 +408,7 @@ public class VP8AdaptiveSourceProjectionContext
     private VP8FrameProjection createLayerSwitchProjection(
         @NotNull VP8Frame frame,
         @NotNull Vp8Packet initialPacket,
-        long receivedMs)
+        @Nullable Instant receivedTime)
     {
         assert(frame.isKeyframe());
         assert(initialPacket.isStartOfFrame());
@@ -443,9 +435,10 @@ public class VP8AdaptiveSourceProjectionContext
         // this is a simulcast switch. The typical incremental value =
         // 90kHz / 30 = 90,000Hz / 30 = 3000 per frame or per 33ms
         long tsDelta;
-        if (lastVP8FrameProjection.getCreatedMs() != 0)
+        if (receivedTime != null && lastVP8FrameProjection.getCreated() != null)
         {
-            tsDelta = 3000 * Math.max(1, (receivedMs - lastVP8FrameProjection.getCreatedMs()) / 33);
+            tsDelta = 3000 * Math.max(1,
+                Duration.between(lastVP8FrameProjection.getCreated(), receivedTime).dividedBy(33).toMillis());
         }
         else
         {
@@ -462,7 +455,8 @@ public class VP8AdaptiveSourceProjectionContext
             tl0PicIdx = VpxUtils.applyTl0PicIdxDelta(lastVP8FrameProjection.getTl0PICIDX(),
                 1);
         }
-        else {
+        else
+        {
             picId = frame.getPictureId();
             tl0PicIdx = frame.getTl0PICIDX();
         }
@@ -471,7 +465,7 @@ public class VP8AdaptiveSourceProjectionContext
             new VP8FrameProjection(diagnosticContext,
                 frame, lastVP8FrameProjection.getSSRC(), projectedTs,
                 RtpUtils.getSequenceNumberDelta(projectedSeq, initialPacket.getSequenceNumber()),
-                picId, tl0PicIdx, receivedMs
+                picId, tl0PicIdx, receivedTime
             );
 
         return projection;
@@ -482,7 +476,7 @@ public class VP8AdaptiveSourceProjectionContext
      */
     @NotNull
     private VP8FrameProjection createResetProjection(@NotNull VP8Frame frame,
-        @NotNull Vp8Packet initialPacket, long receivedMs)
+        @NotNull Vp8Packet initialPacket, @Nullable Instant receivedTime)
     {
         VP8Frame lastFrame = lastVP8FrameProjection.getVP8Frame();
 
@@ -504,7 +498,7 @@ public class VP8AdaptiveSourceProjectionContext
             new VP8FrameProjection(diagnosticContext,
                 frame, lastVP8FrameProjection.getSSRC(), projectedTs,
                 seqDelta,
-                projectedPicId, projectedTl0PicIdx, receivedMs
+                projectedPicId, projectedTl0PicIdx, receivedTime
             );
 
         return projection;
@@ -517,7 +511,7 @@ public class VP8AdaptiveSourceProjectionContext
     @NotNull
     private VP8FrameProjection createInLayerProjection(@NotNull VP8Frame frame,
         @NotNull VP8Frame refFrame, @NotNull Vp8Packet initialPacket,
-        long receivedMs)
+        @Nullable Instant receivedTime)
     {
         long tsGap = RtpUtils.getTimestampDiff(frame.getTimestamp(), refFrame.getTimestamp());
         int tl0Gap = VpxUtils.getTl0PicIdxDelta(frame.getTl0PICIDX(), refFrame.getTl0PICIDX());
@@ -573,7 +567,7 @@ public class VP8AdaptiveSourceProjectionContext
             new VP8FrameProjection(diagnosticContext,
                 frame, lastVP8FrameProjection.getSSRC(), projectedTs,
                 RtpUtils.getSequenceNumberDelta(projectedSeq, initialPacket.getSequenceNumber()),
-                projectedPicId, projectedTl0PicIdx, receivedMs
+                projectedPicId, projectedTl0PicIdx, receivedTime
             );
 
         return projection;
@@ -587,18 +581,18 @@ public class VP8AdaptiveSourceProjectionContext
     private VP8FrameProjection createInLayerProjection(
         @NotNull VP8Frame frame,
         @NotNull Vp8Packet initialPacket,
-        long receivedMs)
+        @Nullable Instant receivedTime)
     {
         VP8Frame prevFrame = findPrevAcceptedFrame(frame);
         if (prevFrame != null)
         {
-            return createInLayerProjection(frame, prevFrame, initialPacket, receivedMs);
+            return createInLayerProjection(frame, prevFrame, initialPacket, receivedTime);
         }
         /* prev frame has rolled off beginning of frame map, try next frame */
         VP8Frame nextFrame = findNextAcceptedFrame(frame);
         if (nextFrame != null)
         {
-            return createInLayerProjection(frame, nextFrame, initialPacket, receivedMs);
+            return createInLayerProjection(frame, nextFrame, initialPacket, receivedTime);
         }
 
         /* Neither previous or next is found. Very big frame? Use previous projected.
@@ -606,23 +600,29 @@ public class VP8AdaptiveSourceProjectionContext
            frameIsNewSsrc has returned false.)
          */
         return createInLayerProjection(frame, lastVP8FrameProjection.getVP8Frame(),
-            initialPacket, receivedMs);
+            initialPacket, receivedTime);
+    }
+
+    @Override
+    public boolean shouldRequestKeyframe()
+    {
+        return vp8QualityFilter.shouldRequestKeyframe()
+            || (needsKeyframeToStart() && vp8QualityFilter.mayRequestKeyframe());
     }
 
     @Override
     public boolean needsKeyframe()
     {
-        if (vp8QualityFilter.needsKeyframe())
-        {
-            return true;
-        }
+        return vp8QualityFilter.needsKeyframe() || needsKeyframeToStart();
+    }
 
-        if (lastVP8FrameProjection.getVP8Frame() == null)
-        {
-            /* Never sent anything */
-            return true;
-        }
-        return false;
+    /**
+     * Whether a keyframe is needed for a reason of this context's own, not the quality filter's: nothing has been
+     * sent yet.
+     */
+    private boolean needsKeyframeToStart()
+    {
+        return lastVP8FrameProjection.getVP8Frame() == null;
     }
 
     /**
@@ -668,12 +668,6 @@ public class VP8AdaptiveSourceProjectionContext
             lastVP8FrameProjection.getTimestamp());
     }
 
-    @Override
-    public PayloadType getPayloadType()
-    {
-        return payloadType;
-    }
-
     /**
      * Rewrites the RTP packet that is specified as an argument.
      *
@@ -708,7 +702,8 @@ public class VP8AdaptiveSourceProjectionContext
             throw new RewriteException("Frame not in tracker (aged off?)");
         }
 
-        if (vp8Frame.getProjection() == null) {
+        if (vp8Frame.getProjection() == null)
+        {
             /* Shouldn't happen for an accepted packet whose frame is still known? */
             throw new RewriteException("Frame does not have projection?");
         }
@@ -720,26 +715,23 @@ public class VP8AdaptiveSourceProjectionContext
      * {@inheritDoc}
      */
     @Override
-    @SuppressWarnings("unchecked")
-    public synchronized JSONObject getDebugState()
+    public synchronized ObjectNode getDebugState()
     {
-        JSONObject debugState = new JSONObject();
+        ObjectNode debugState = JsonNodeFactory.instance.objectNode();
         debugState.put(
                 "class",
                 VP8AdaptiveSourceProjectionContext.class.getSimpleName());
 
-        JSONArray mapSizes = new JSONArray();
+        ArrayNode mapSizes = JsonNodeFactory.instance.arrayNode();
         for (Map.Entry<Long, VP8FrameMap> entry: vp8FrameMaps.entrySet())
         {
-            JSONObject sizeInfo = new JSONObject();
+            ObjectNode sizeInfo = JsonNodeFactory.instance.objectNode();
             sizeInfo.put("ssrc", entry.getKey());
             sizeInfo.put("size", entry.getValue().size());
             mapSizes.add(sizeInfo);
         }
-        debugState.put(
-                "vp8FrameMaps", mapSizes);
-        debugState.put("vp8QualityFilter", vp8QualityFilter.getDebugState());
-        debugState.put("payloadType", payloadType.toString());
+        debugState.set("vp8FrameMaps", mapSizes);
+        debugState.set("vp8QualityFilter", vp8QualityFilter.getDebugState());
 
         return debugState;
     }

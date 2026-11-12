@@ -16,20 +16,21 @@
 
 package org.jitsi.videobridge.rest.root.colibri.mucclient
 
+import com.fasterxml.jackson.databind.node.ObjectNode
+import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
 import io.kotest.matchers.shouldBe
 import io.mockk.every
 import io.mockk.mockk
 import io.mockk.slot
+import jakarta.ws.rs.client.Entity
+import jakarta.ws.rs.core.Application
 import org.eclipse.jetty.http.HttpStatus
 import org.glassfish.jersey.server.ResourceConfig
 import org.glassfish.jersey.test.JerseyTest
 import org.glassfish.jersey.test.TestProperties
 import org.jitsi.videobridge.rest.MockBinder
 import org.jitsi.videobridge.xmpp.XmppConnection
-import org.json.simple.JSONObject
 import org.junit.Test
-import javax.ws.rs.client.Entity
-import javax.ws.rs.core.Application
 
 class MucClientTest : JerseyTest() {
     private lateinit var xmppConnection: XmppConnection
@@ -50,11 +51,11 @@ class MucClientTest : JerseyTest() {
 
     @Test
     fun testAddMuc() {
-        val jsonConfigSlot = slot<JSONObject>()
+        val jsonConfigSlot = slot<ObjectNode>()
 
         every { xmppConnection.addMucClient(capture(jsonConfigSlot)) } returns true
 
-        val json = JSONObject().apply {
+        val json = jacksonObjectMapper().createObjectNode().apply {
             put("id", "id")
             put("hostname", "hostname")
             put("username", "username")
@@ -63,18 +64,19 @@ class MucClientTest : JerseyTest() {
             put("muc_nickname", "muc_nickname")
         }
 
-        val resp = target("$baseUrl/add").request().post(Entity.json(json.toJSONString()))
+        val resp = target("$baseUrl/add").request().post(Entity.json(json.toString()))
         resp.status shouldBe HttpStatus.OK_200
-        jsonConfigSlot.captured shouldBe json
+        // Compare JSON content (ObjectNode captured from request vs ObjectNode sent)
+        jsonConfigSlot.captured["id"]?.asText() shouldBe "id"
     }
 
     @Test
     fun testAddMucFailure() {
-        val jsonConfigSlot = slot<JSONObject>()
+        val jsonConfigSlot = slot<ObjectNode>()
 
         every { xmppConnection.addMucClient(capture(jsonConfigSlot)) } returns false
 
-        val json = JSONObject().apply {
+        val json = jacksonObjectMapper().createObjectNode().apply {
             put("id", "id")
             put("hostname", "hostname")
             put("username", "username")
@@ -83,33 +85,44 @@ class MucClientTest : JerseyTest() {
             put("muc_nickname", "muc_nickname")
         }
 
-        val resp = target("$baseUrl/add").request().post(Entity.json(json.toJSONString()))
+        val resp = target("$baseUrl/add").request().post(Entity.json(json.toString()))
         resp.status shouldBe HttpStatus.BAD_REQUEST_400
     }
 
     @Test
     fun testRemoveMuc() {
-        val jsonConfigSlot = slot<JSONObject>()
+        val jsonConfigSlot = slot<ObjectNode>()
 
-        every { xmppConnection.addMucClient(capture(jsonConfigSlot)) } returns true
+        every { xmppConnection.removeMucClient(capture(jsonConfigSlot)) } returns true
 
-        val json = JSONObject().apply {
+        val json = jacksonObjectMapper().createObjectNode().apply {
             put("id", "id")
         }
 
-        val resp = target("$baseUrl/add").request().post(Entity.json(json.toJSONString()))
+        val resp = target("$baseUrl/remove").request().post(Entity.json(json.toString()))
         resp.status shouldBe HttpStatus.OK_200
-        jsonConfigSlot.captured shouldBe json
+        jsonConfigSlot.captured["id"]?.asText() shouldBe "id"
     }
 
     @Test
     fun testRemoveMucFailure() {
-        every { xmppConnection.addMucClient(any()) } returns false
+        every { xmppConnection.removeMucClient(any()) } returns false
 
-        val json = JSONObject().apply {
+        val json = jacksonObjectMapper().createObjectNode().apply {
             put("id", "id")
         }
-        val resp = target("$baseUrl/add").request().post(Entity.json(json.toJSONString()))
+        val resp = target("$baseUrl/remove").request().post(Entity.json(json.toString()))
         resp.status shouldBe HttpStatus.BAD_REQUEST_400
+    }
+
+    @Test
+    fun testGetIds() {
+        val fakeIds = jacksonObjectMapper().createArrayNode().apply {
+            add("id1")
+        }
+        every { xmppConnection.getMucClientIds() } returns fakeIds.toString()
+
+        val resp = target("$baseUrl/list").request().get()
+        resp.readEntity(String::class.java) shouldBe "[\"id1\"]"
     }
 }

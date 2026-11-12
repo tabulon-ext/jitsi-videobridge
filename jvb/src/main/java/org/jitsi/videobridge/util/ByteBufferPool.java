@@ -16,6 +16,8 @@
 
 package org.jitsi.videobridge.util;
 
+import com.fasterxml.jackson.databind.node.JsonNodeFactory;
+import com.fasterxml.jackson.databind.node.ObjectNode;
 import org.jetbrains.annotations.*;
 import org.jitsi.nlj.util.*;
 import org.jitsi.utils.logging2.*;
@@ -231,9 +233,9 @@ public class ByteBufferPool
     /**
      * Gets a JSON representation of the statistics about the pool.
      */
-    public static OrderedJsonObject getStatsJson()
+    public static ObjectNode getStatsJson()
     {
-        OrderedJsonObject stats = new OrderedJsonObject();
+        ObjectNode stats = JsonNodeFactory.instance.objectNode();
         long numLargeRequestsSum = numLargeRequests.sum();
 
         stats.put("num_large_requests", numLargeRequestsSum);
@@ -243,16 +245,19 @@ public class ByteBufferPool
             long numRequestsSum = numRequests.sum();
             long allAllocations = numLargeRequestsSum + pool1.getNumAllocations()
                 + pool2.getNumAllocations() + pool3.getNumAllocations();
+            long storedBytes = pool1.getStoredBytes() + pool2.getStoredBytes()
+                + pool3.getStoredBytes();
             stats.put("num_requests", numRequestsSum);
             stats.put("num_returns", numReturns.sum());
             stats.put("num_allocations", allAllocations);
             stats.put(
                 "allocation_percent",
                 (100.0 * allAllocations) / numRequestsSum);
+            stats.put("stored_bytes", storedBytes);
 
-            stats.put("pool1", pool1.getStats());
-            stats.put("pool2", pool2.getStats());
-            stats.put("pool3", pool3.getStats());
+            stats.set("pool1", pool1.getStats());
+            stats.set("pool2", pool2.getStats());
+            stats.set("pool3", pool3.getStats());
         }
 
         if (bookkeepingEnabled)
@@ -296,7 +301,8 @@ public class ByteBufferPool
         return bookkeepingEnabled;
     }
 
-    private static class BufferEvent {
+    private static class BufferEvent
+    {
         final String context;
         final Long timestamp;
         final Exception trace;

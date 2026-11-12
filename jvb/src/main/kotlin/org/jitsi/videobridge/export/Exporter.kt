@@ -1,0 +1,716 @@
+/*
+ * Copyright @ 2024 - Present, 8x8 Inc
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.jitsi.videobridge.export
+
+import com.fasterxml.jackson.databind.node.JsonNodeFactory
+import com.fasterxml.jackson.databind.node.ObjectNode
+import org.eclipse.jetty.websocket.api.Callback
+import org.eclipse.jetty.websocket.api.Session
+import org.eclipse.jetty.websocket.api.exceptions.WebSocketTimeoutException
+import org.eclipse.jetty.websocket.client.ClientUpgradeRequest
+import org.eclipse.jetty.websocket.client.WebSocketClient
+import org.eclipse.jetty.websocket.core.CloseStatus
+import org.jitsi.config.JitsiConfig
+import org.jitsi.mediajson.Event
+import org.jitsi.mediajson.InfoEvent
+import org.jitsi.mediajson.MediaEvent
+import org.jitsi.mediajson.PingEvent
+import org.jitsi.mediajson.PongEvent
+import org.jitsi.mediajson.SessionEndEvent
+import org.jitsi.mediajson.SourcesEvent
+import org.jitsi.mediajson.SpeakersEvent
+import org.jitsi.mediajson.StartEvent
+import org.jitsi.mediajson.StopEvent
+import org.jitsi.mediajson.TranscriptionResultEvent
+import org.jitsi.metaconfig.config
+import org.jitsi.metaconfig.optionalconfig
+import org.jitsi.nlj.PacketInfo
+import org.jitsi.nlj.rtp.AudioRtpPacket
+import org.jitsi.nlj.util.PacketInfoQueue
+import org.jitsi.utils.logging2.Logger
+import org.jitsi.videobridge.PotentialPacketHandler
+import org.jitsi.videobridge.metrics.VideobridgeMetricsContainer
+import org.jitsi.videobridge.relay.RelayConfig
+import org.jitsi.videobridge.util.ByteBufferPool
+import org.jitsi.videobridge.util.TaskPools
+import org.jitsi.videobridge.version.JvbVersionService
+import org.jitsi.videobridge.websocket.config.WebsocketServiceConfig
+import org.jitsi.xmpp.extensions.colibri2.Connect
+import java.io.EOFException
+import java.net.URI
+import java.nio.channels.ClosedChannelException
+import java.time.Duration
+import java.util.concurrent.ScheduledFuture
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicLong
+import kotlin.math.min
+import kotlin.math.pow
+
+internal class Exporter(
+    private val url: URI,
+    private val httpHeaders: Map<String, String>,
+    val logger: Logger,
+    /** The conference-side sinks and SSRC lookups this exporter calls back into. */
+    private val eventHandler: ExporterEventHandler,
+    private val pingEnabled: Boolean = false,
+    private val pingIntervalMs: Int = 0,
+    private val pingTimeoutMs: Int = 0,
+    private val type: Connect.Types = Connect.Types.RECORDER,
+    /** Source names to export (send out), communicated to the peer via a [SourcesEvent]. */
+    @Volatile private var exports: List<String> = emptyList(),
+    /** Source names requested (to receive back), communicated to the peer via a [SourcesEvent]. */
+    @Volatile private var requests: List<String> = emptyList()
+) : PotentialPacketHandler {
+    private val isShuttingDown = AtomicBoolean(false)
+    private val reconnectAttempts = AtomicInteger(0)
+    private var reconnectFuture: ScheduledFuture<*>? = null
+
+    /** Set by a terminal close from the peer; the exporter then stays closed until its connect is expired. */
+    @Volatile
+    private var terminalClose: TerminalClose? = null
+
+    @Volatile
+    private var reconnectExhausted = false
+
+    /** The conference's recent speakers as last reported by [speakersChanged]; null until the first report. */
+    @Volatile
+    private var speakers: Speakers? = null
+
+    // Ping/pong state
+    private var pingScheduledFuture: ScheduledFuture<*>? = null
+
+    @Volatile
+    internal var pingTimeoutFuture: ScheduledFuture<*>? = null
+
+    private val nextPingId = AtomicInteger(0)
+    internal val lastPingSentId = AtomicInteger(0)
+    internal val lastPongReceivedMs = AtomicLong(0)
+
+    // Instance-level counters for debugState
+    private val instancePacketsSent = AtomicLong(0)
+    private val instanceWebSocketFailures = AtomicLong(0)
+    private val instanceWebSocketInternalErrors = AtomicLong(0)
+    private val instanceStarts = AtomicLong(0)
+    private val instanceTranscriptsReceived = AtomicLong(0)
+    private val instanceMediaEventsReceived = AtomicLong(0)
+    private val instanceSendingChangesReceived = AtomicLong(0)
+    private val instanceOtherMessagesReceived = AtomicLong(0)
+    private val instanceParseFailures = AtomicLong(0)
+    private val instanceInfoReceived = AtomicLong(0)
+
+    val queue: PacketInfoQueue by lazy {
+        PacketInfoQueue(
+            "${javaClass.simpleName}-packet-queue",
+            TaskPools.IO_POOL,
+            this::doHandlePacket,
+            1024
+        )
+    }
+
+    /** One connection to the peer. Its loss can be reported more than once, also after its replacement is open. */
+    inner class RecorderWebSocket : Session.Listener.AutoDemanding {
+        @Volatile
+        var session: Session? = null
+
+        val isConnected: Boolean
+            get() = session != null
+
+        @Volatile
+        private var openedAtMs: Long = 0
+
+        private val lost = AtomicBoolean(false)
+
+        /**
+         * True only at the first report that the connection in use is lost. Also stops the ping then and, after a
+         * stable connection, starts the count of reconnect attempts again.
+         */
+        fun markLost(): Boolean {
+            if (this !== recorderWebSocket) {
+                logger.debug { "Ignoring the loss of a connection that was already replaced" }
+                return false
+            }
+            if (!lost.compareAndSet(false, true)) {
+                logger.debug { "Ignoring a repeated report of the loss of the connection" }
+                return false
+            }
+            stopPing()
+            val openedAt = openedAtMs
+            if (openedAt > 0 && System.currentTimeMillis() - openedAt > stableConnectionThreshold.toMillis()) {
+                reconnectAttempts.set(0)
+            }
+            return true
+        }
+
+        override fun onWebSocketClose(statusCode: Int, reason: String?) {
+            session = null
+            val reconnectDue = markLost()
+            val internalError = statusCode == 1011
+            if (internalError) {
+                webSocketInternalErrors.inc()
+                instanceWebSocketInternalErrors.incrementAndGet()
+            }
+            if (statusCode == CLOSE_AGENT_ENDED || statusCode == CLOSE_ENDPOINT_UNREACHABLE) {
+                terminalClose = TerminalClose(statusCode, reason)
+                // A reconnect already scheduled by an error or a ping timeout must not redial either.
+                cancelReconnect()
+                val message = "Websocket closed with terminal status $statusCode, reason: $reason. Not reconnecting."
+                if (statusCode == CLOSE_ENDPOINT_UNREACHABLE) {
+                    // The dial to the agent endpoint failed (or the agent broke the contract): worth an operator's eye.
+                    endpointUnreachableCount.inc()
+                    logger.warn(message)
+                } else {
+                    logger.info(message)
+                }
+            } else {
+                logger.info("Websocket closed with status $statusCode, reason: $reason")
+                if (reconnectDue && !isShuttingDown.get()) {
+                    scheduleReconnect()
+                }
+            }
+        }
+
+        override fun onWebSocketOpen(session: Session) {
+            this.session = session
+            if (this !== recorderWebSocket || isShuttingDown.get() || terminalClose != null) {
+                // A stop or a terminal close does not see a dial that is under way, so it is ended here.
+                this.session = null
+                logger.info("Closing a websocket that opened when it was no longer wanted")
+                session.close(CloseStatus.SHUTDOWN, "closing", Callback.NOOP)
+                return
+            }
+            openedAtMs = System.currentTimeMillis()
+            logger.info("Websocket connected: $isConnected")
+            serializer = initSerializer()
+            cancelReconnect()
+            startPing()
+            // The peer numbers the media it produces from the start again on a new connection.
+            requests.takeIf { it.isNotEmpty() }?.let { eventHandler.handleProducerConnected(it) }
+            // Declare our exported/requested sources to the peer, if any, now that the connection is up.
+            if (exports.isNotEmpty() || requests.isNotEmpty()) {
+                sendSources()
+            }
+            sendSpeakers()
+            sendInfo()
+        }
+
+        override fun onWebSocketError(cause: Throwable?) {
+            if (cause.isRemoteClosedOrTimedOut()) {
+                // Expected (the peer went away or stopped responding); the connection is re-established below.
+                logger.warn("Websocket error: $cause")
+            } else {
+                logger.error("Websocket error", cause)
+            }
+            webSocketFailures.inc()
+            instanceWebSocketFailures.incrementAndGet()
+            if (markLost() && !isShuttingDown.get()) {
+                scheduleReconnect()
+            }
+        }
+
+        override fun onWebSocketText(message: String) {
+            handleIncomingMessage(message)
+        }
+    }
+
+    /**
+     * The connection in use. Internal (rather than private) so [ExporterTest] can install a mock session without
+     * opening a socket.
+     */
+    @Volatile
+    internal var recorderWebSocket = RecorderWebSocket()
+        private set
+
+    /** Internal (rather than private) so [ExporterTest] can replace the connection without dialing. */
+    internal fun newConnection(): RecorderWebSocket {
+        // After a ping timeout the old session can wait a long time for the reply to its close, out of reach of stop().
+        recorderWebSocket.session?.disconnect()
+        return RecorderWebSocket().also { recorderWebSocket = it }
+    }
+
+    private var serializer: MediaJsonSerializer? = null
+
+    private fun initSerializer() = MediaJsonSerializer(eventHandler::getAudioSourceName, eventHandler::getDiarize) {
+        val session = recorderWebSocket.session
+        if (session != null) {
+            session.sendText(it.toJson(), Callback.NOOP)
+        } else {
+            logger.warn("Not connected, cannot send event: $it")
+        }
+    }
+
+    fun isConnected() = recorderWebSocket.isConnected
+
+    /**
+     * Whether to forward this packet to this exporter: it must be audio from a source we export. A connect that
+     * produces synthetic audio (non-empty [requests]: a voice agent or translator) exports only the sources named in
+     * [exports], so an empty list means "export nothing" until participants are explicitly listed. A connect with no
+     * [requests] (transcriber, recorder) keeps the rule that an empty [exports] list means "export all audio". Either
+     * way the SSRC must resolve to a signaled source: audio from an unknown (e.g. not-yet-signaled) SSRC isn't routed
+     * to receivers, so it isn't exported either.
+     */
+    override fun wants(packet: PacketInfo): Boolean {
+        if (!isConnected()) return false
+        val audioPacket = packet.packet as? AudioRtpPacket ?: return false
+        val sourceName = eventHandler.getAudioSourceName(audioPacket.ssrc) ?: return false
+        return exportsSource(sourceName)
+    }
+
+    /** Whether audio from the source with this name is exported to the peer (see [wants]). */
+    private fun exportsSource(sourceName: String) = (exports.isEmpty() && requests.isEmpty()) || sourceName in exports
+
+    /**
+     * Apply an update to the connect with this exporter's URL. Only the exported/requested source names may change
+     * on a running exporter; changes to other parameters are rejected by [ExporterWrapper] before reaching here.
+     */
+    fun update(exports: List<String>, requests: List<String>) {
+        if (terminalClose != null || reconnectExhausted) {
+            logger.warn(
+                "Updating exports=$exports requests=$requests on a connect that will not reconnect " +
+                    "(terminal close ${terminalClose?.code}, reconnects exhausted $reconnectExhausted); " +
+                    "the peer will not get them."
+            )
+        } else {
+            logger.info("Updating exports=$exports requests=$requests")
+        }
+        this.exports = exports
+        this.requests = requests
+        // If we're connected, propagate the change now; otherwise it will be sent when the connection opens.
+        sendSources()
+        // The speakers the peer may know about follow the exports.
+        sendSpeakers()
+    }
+
+    /**
+     * Pass on the conference's recent speakers, the dominant speaker first, so the peer can follow the dominant
+     * speaker without measuring audio levels itself. Only agent connects get them: no other peer type has a use for
+     * them, and a third-party recorder might not tolerate an unknown event. Like the audio, the list is limited to
+     * the sources this connect exports.
+     *
+     * The agent's own audio counts for dominant speaker, but its synthetic source is never in the list, so the first
+     * entry is the top human: the agent is not told it is the dominant speaker, and under the `dominant` fan-in it
+     * keeps hearing the last human while it talks. The list is therefore empty while only the agent has spoken.
+     */
+    fun speakersChanged(recentSpeakers: List<String>, silence: Boolean) {
+        if (type != Connect.Types.AGENT) return
+        speakers = Speakers(recentSpeakers, silence)
+        sendSpeakers()
+    }
+
+    /** Send the exported part of the current speaker order to the peer. No-op if not connected or not yet known. */
+    private fun sendSpeakers() {
+        val session = recorderWebSocket.session ?: return
+        val speakers = speakers ?: return
+        val exported = speakers.order.filter { exportsSource(it) }
+        session.sendText(SpeakersEvent(exported, speakers.silence).toJson(), Callback.NOOP)
+    }
+
+    /** Send the current exported/requested source names to the peer. No-op if not currently connected. */
+    private fun sendSources() {
+        val session = recorderWebSocket.session ?: return
+        logger.info("Sending sources: exports=$exports requests=$requests")
+        session.sendText(SourcesEvent(exports, requests).toJson(), Callback.NOOP)
+    }
+
+    /** Internal (rather than private) so [ExporterTest] can drive the event dispatch without opening a socket. */
+    internal fun handleIncomingMessage(message: String) {
+        try {
+            val event = Event.parse(message)
+            logger.debug { "Received message from websocket: ${event.toJson()}" }
+
+            when (event) {
+                is TranscriptionResultEvent -> {
+                    transcriptsReceivedCount.inc()
+                    instanceTranscriptsReceived.incrementAndGet()
+                    eventHandler.handleTranscriptionResult(event)
+                }
+
+                is PongEvent -> {
+                    val expectedId = lastPingSentId.get()
+                    if (event.id == expectedId) {
+                        logger.debug { "Received pong with matching id=${event.id}" }
+                        lastPongReceivedMs.set(System.currentTimeMillis())
+                        // Cancel any pending timeout
+                        pingTimeoutFuture?.cancel(false)
+                        pingTimeoutFuture = null
+                    } else {
+                        logger.warn("Received pong with id=${event.id}, expected id=$expectedId")
+                    }
+                }
+
+                is MediaEvent -> {
+                    mediaEventsReceivedCount.inc()
+                    instanceMediaEventsReceived.incrementAndGet()
+                    eventHandler.handleMediaEvent(event)
+                }
+
+                is StartEvent -> {
+                    // A `start` with a talk timestamp brackets the beginning of a "talk" (translated audio); one
+                    // without is a plain stream-start announcement (the bridge->peer direction), which the bridge
+                    // does not act on when received.
+                    val timestamp = event.start.timestamp
+                    if (timestamp != null) {
+                        sendingChangesReceivedCount.inc()
+                        instanceSendingChangesReceived.incrementAndGet()
+                        eventHandler.handleSendingChange(event.start.tag, true, timestamp)
+                    } else {
+                        otherMessagesReceivedCount.inc()
+                        instanceOtherMessagesReceived.incrementAndGet()
+                    }
+                }
+
+                is StopEvent -> {
+                    // A `stop` with a talk timestamp brackets the end of a "talk"; a plain stop without one is a
+                    // stream-end the bridge does not act on when received.
+                    val timestamp = event.stop.timestamp
+                    if (timestamp != null) {
+                        sendingChangesReceivedCount.inc()
+                        instanceSendingChangesReceived.incrementAndGet()
+                        eventHandler.handleSendingChange(event.stop.tag, false, timestamp)
+                    } else {
+                        otherMessagesReceivedCount.inc()
+                        instanceOtherMessagesReceived.incrementAndGet()
+                    }
+                }
+
+                is InfoEvent -> {
+                    infoReceivedCount.inc()
+                    instanceInfoReceived.incrementAndGet()
+                    logger.info("Received InfoEvent: ${event.toJson()}")
+                }
+
+                else -> {
+                    otherMessagesReceivedCount.inc()
+                    instanceOtherMessagesReceived.incrementAndGet()
+                }
+            }
+        } catch (e: Exception) {
+            logger.warn("Failed to parse incoming websocket message: $message", e)
+            parseFailuresCount.inc()
+            instanceParseFailures.incrementAndGet()
+        }
+    }
+
+    /**
+     * Send an informational message describing this application to the peer, once the connection
+     * is up. Used for runtime observability (the peer logs what it received). No-op if disconnected.
+     */
+    private fun sendInfo() {
+        val session = recorderWebSocket.session ?: return
+        val info = InfoEvent()
+            .put("application", "jitsi-videobridge")
+            .put("version", JvbVersionService.instance.currentVersion.toString())
+        RelayConfig.config.region?.let { info.put("region", it) }
+        try {
+            logger.info("Sending info to transcriber: ${info.toJson()}")
+            session.sendText(info.toJson(), Callback.NOOP)
+        } catch (e: Exception) {
+            logger.warn("Failed to send info message", e)
+        }
+    }
+
+    private fun sendPing() {
+        val connection = recorderWebSocket
+        val session = connection.session
+        if (session == null || isShuttingDown.get()) {
+            return
+        }
+
+        val pingId = nextPingId.incrementAndGet()
+        val pingEvent = PingEvent(pingId)
+
+        try {
+            lastPingSentId.set(pingId)
+            pingTimeoutFuture = TaskPools.SCHEDULED_POOL.schedule({
+                handlePingTimeout(connection)
+            }, pingTimeoutMs.toLong(), TimeUnit.MILLISECONDS)
+
+            session.sendText(pingEvent.toJson(), Callback.NOOP)
+            logger.debug { "Sent ping with id=$pingId" }
+        } catch (e: Exception) {
+            pingTimeoutFuture?.cancel(false)
+            pingTimeoutFuture = null
+            logger.warn("Failed to send ping message", e)
+        }
+    }
+
+    private fun handlePingTimeout(connection: RecorderWebSocket) {
+        if (!connection.markLost()) {
+            return
+        }
+        logger.warn("Ping timeout, reconnecting websocket")
+
+        // Force reconnect on timeout
+        connection.session?.close(1000, "Ping timeout", Callback.NOOP)
+        scheduleReconnect()
+    }
+
+    private fun startPing() {
+        if (!pingEnabled || pingIntervalMs <= 0) {
+            return
+        }
+
+        logger.info("Starting ping with interval=$pingIntervalMs ms, timeout=$pingTimeoutMs ms")
+        stopPing()
+
+        // Schedule recurring ping
+        pingScheduledFuture = TaskPools.SCHEDULED_POOL.scheduleAtFixedRate(
+            { sendPing() },
+            pingIntervalMs.toLong(),
+            pingIntervalMs.toLong(),
+            TimeUnit.MILLISECONDS
+        )
+    }
+
+    private fun stopPing() {
+        pingScheduledFuture?.cancel(false)
+        pingScheduledFuture = null
+        pingTimeoutFuture?.cancel(false)
+        pingTimeoutFuture = null
+    }
+
+    /** Run inside the queue thread, handle a packet. */
+    private fun doHandlePacket(packet: PacketInfo): Boolean {
+        if (recorderWebSocket.isConnected) {
+            serializer?.encode(packet)
+            packetsSentCount.inc()
+            instancePacketsSent.incrementAndGet()
+        }
+        ByteBufferPool.returnBuffer(packet.packet.buffer)
+        return true
+    }
+
+    override fun send(packet: PacketInfo) {
+        if (recorderWebSocket.isConnected) {
+            queue.add(packet)
+        } else {
+            ByteBufferPool.returnBuffer(packet.packet.buffer)
+        }
+    }
+
+    private fun scheduleReconnect() {
+        if (isShuttingDown.get() || terminalClose != null) {
+            return
+        }
+
+        val attempt = reconnectAttempts.incrementAndGet()
+        val maxAttempts = listOfNotNull(
+            maxReconnectAttempts,
+            agentMaxReconnectAttempts.takeIf { type == Connect.Types.AGENT }
+        ).minOrNull()
+        if (maxAttempts != null && attempt > maxAttempts) {
+            reconnectExhausted = true
+            reconnectsExhaustedCount.inc()
+            logger.warn("Max reconnection attempts ($maxAttempts) reached, giving up")
+            return
+        }
+
+        val delayMs = getDelayMs(attempt)
+        logger.info("Scheduling reconnection attempt $attempt in $delayMs ms")
+
+        cancelReconnect()
+        reconnectFuture = TaskPools.SCHEDULED_POOL.schedule({
+            if (!isShuttingDown.get() && terminalClose == null) {
+                try {
+                    logger.info("Attempting reconnection (attempt $attempt)")
+                    webSocketClient.connect(newConnection(), url, createUpgradeRequest())
+                } catch (e: Exception) {
+                    logger.warn("Reconnection attempt $attempt failed", e)
+                    scheduleReconnect()
+                }
+            }
+        }, delayMs, TimeUnit.MILLISECONDS)
+    }
+
+    private fun cancelReconnect() {
+        reconnectFuture?.cancel(false)
+        reconnectFuture = null
+    }
+
+    private fun createUpgradeRequest() = ClientUpgradeRequest().apply {
+        httpHeaders.forEach { (name, value) ->
+            setHeader(name, value)
+        }
+    }
+
+    fun start() {
+        isShuttingDown.set(false)
+        startsCount.inc()
+        instanceStarts.incrementAndGet()
+        webSocketClient.connect(recorderWebSocket, url, createUpgradeRequest())
+    }
+
+    fun stop() {
+        isShuttingDown.set(true)
+        stopPing()
+        cancelReconnect()
+        if (recorderWebSocket.isConnected) {
+            recorderWebSocket.session?.sendText(SessionEndEvent().toJson(), Callback.NOOP)
+        }
+        recorderWebSocket.session?.close(CloseStatus.SHUTDOWN, "closing", Callback.NOOP)
+        recorderWebSocket.session?.disconnect()
+        queue.close()
+    }
+
+    fun debugState(): ObjectNode = JsonNodeFactory.instance.objectNode().apply {
+        put("url", url.toString())
+        put("type", type.toString().lowercase())
+        putArray("exports").apply { exports.forEach { add(it) } }
+        putArray("requests").apply { requests.forEach { add(it) } }
+        speakers?.let { put("speakers", it.order.toString()) }
+        put("is_connected", isConnected())
+        put("is_shutting_down", isShuttingDown.get())
+        put("reconnect_attempts", reconnectAttempts.get())
+        put("reconnect_exhausted", reconnectExhausted)
+        terminalClose?.let { putObject("terminal_close").put("code", it.code).put("reason", it.reason) }
+        put("packets_sent", instancePacketsSent.get())
+        put("websocket_failures", instanceWebSocketFailures.get())
+        put("websocket_internal_errors", instanceWebSocketInternalErrors.get())
+        put("starts", instanceStarts.get())
+        put("transcripts_received", instanceTranscriptsReceived.get())
+        put("media_events_received", instanceMediaEventsReceived.get())
+        put("sending_changes_received", instanceSendingChangesReceived.get())
+        put("other_messages_received", instanceOtherMessagesReceived.get())
+        put("parse_failures", instanceParseFailures.get())
+        put("info_received", instanceInfoReceived.get())
+        put("queue_size", queue.size())
+        put("ping_enabled", pingEnabled)
+        if (pingEnabled) {
+            put("ping_interval_ms", pingIntervalMs)
+            put("ping_timeout_ms", pingTimeoutMs)
+            put("last_pong_received_ms", lastPongReceivedMs.get())
+        }
+    }
+
+    private class TerminalClose(val code: Int, val reason: String?)
+
+    /** The conference's recent speakers, the dominant speaker first, and whether it is currently silent. */
+    private data class Speakers(val order: List<String>, val silence: Boolean)
+
+    companion object {
+        /** Terminal close code (opus-transcriber-proxy AGENT_PROTOCOL.md): the agent sent `end`; do not redial. */
+        const val CLOSE_AGENT_ENDED = 4001
+
+        /** Terminal close code (opus-transcriber-proxy AGENT_PROTOCOL.md): endpoint dial failed; do not redial. */
+        const val CLOSE_ENDPOINT_UNREACHABLE = 4002
+
+        private val webSocketClient = WebSocketClient().apply {
+            idleTimeout = WebsocketServiceConfig.config.idleTimeout
+            start()
+        }
+
+        /**
+         * Whether this error means that the remote side closed the connection (EOF without a close frame) or the
+         * connection timed out because the remote side was idle. Other errors (e.g. a failed upgrade) are unexpected.
+         */
+        private fun Throwable?.isRemoteClosedOrTimedOut(): Boolean =
+            generateSequence(this) { it.cause }.take(MAX_CAUSE_DEPTH).any {
+                it is ClosedChannelException || it is EOFException || it is WebSocketTimeoutException
+            }
+
+        private const val MAX_CAUSE_DEPTH = 5
+
+        private val webSocketFailures = VideobridgeMetricsContainer.instance.registerCounter(
+            "exporter_websocket_failures",
+            "Number of websocket connection failures from Exporter"
+        )
+
+        private val webSocketInternalErrors = VideobridgeMetricsContainer.instance.registerCounter(
+            "exporter_websocket_internal_errors",
+            "Number of websocket connection which were connected but closed with code 1011"
+        )
+
+        private val endpointUnreachableCount = VideobridgeMetricsContainer.instance.registerCounter(
+            "exporter_endpoint_unreachable",
+            "Number of agent connects the peer closed because the agent endpoint could not be dialed (code 4002)"
+        )
+
+        private val reconnectsExhaustedCount = VideobridgeMetricsContainer.instance.registerCounter(
+            "exporter_reconnects_exhausted",
+            "Number of exporters that gave up reconnecting after the maximum number of attempts"
+        )
+
+        private val startsCount = VideobridgeMetricsContainer.instance.registerCounter(
+            "exporter_starts",
+            "Number of times Exporter has been started"
+        )
+
+        private val packetsSentCount = VideobridgeMetricsContainer.instance.registerCounter(
+            "exporter_packets_sent",
+            "Number of packets sent by Exporter"
+        )
+
+        private val transcriptsReceivedCount = VideobridgeMetricsContainer.instance.registerCounter(
+            "exporter_transcripts_received",
+            "Number of transcription results received by Exporter"
+        )
+
+        private val mediaEventsReceivedCount = VideobridgeMetricsContainer.instance.registerCounter(
+            "exporter_media_events_received",
+            "Number of media (translated audio) events received by Exporter"
+        )
+
+        private val sendingChangesReceivedCount = VideobridgeMetricsContainer.instance.registerCounter(
+            "exporter_sending_changes_received",
+            "Number of synthetic-source sending-change (start/stop) events received by Exporter"
+        )
+
+        private val otherMessagesReceivedCount = VideobridgeMetricsContainer.instance.registerCounter(
+            "exporter_other_messages_received",
+            "Number of non-transcription messages received by Exporter"
+        )
+
+        private val parseFailuresCount = VideobridgeMetricsContainer.instance.registerCounter(
+            "exporter_parse_failures",
+            "Number of messages that failed to parse"
+        )
+
+        private val infoReceivedCount = VideobridgeMetricsContainer.instance.registerCounter(
+            "exporter_info_received",
+            "Number of info messages received by Exporter"
+        )
+
+        private val maxReconnectAttempts: Int? by optionalconfig {
+            "videobridge.exporter.max-reconnect-attempts".from(JitsiConfig.newConfig)
+        }
+
+        private val agentMaxReconnectAttempts: Int by config {
+            "videobridge.exporter.agent-max-reconnect-attempts".from(JitsiConfig.newConfig)
+        }
+
+        private val baseDelay: Duration by config {
+            "videobridge.exporter.base-delay".from(JitsiConfig.newConfig)
+        }
+
+        private val maxDelay: Duration by config {
+            "videobridge.exporter.max-delay".from(JitsiConfig.newConfig)
+        }
+
+        val stableConnectionThreshold: Duration by config {
+            "videobridge.exporter.stable-connection-threshold".from(JitsiConfig.newConfig)
+        }
+
+        // 0, base, base * 2, max at 30 seconds. The min is computed in Double space and converted afterwards so that
+        // a large attempt count (where 2.0.pow overflows to Infinity) clamps to maxDelay instead of overflowing Long
+        // and producing a negative (immediate) delay.
+        private fun getDelayMs(attempt: Int) = if (attempt == 1) {
+            0L
+        } else {
+            min(baseDelay.toMillis() * 2.0.pow(attempt - 2), maxDelay.toMillis().toDouble()).toLong()
+        }
+    }
+}

@@ -18,6 +18,8 @@ package org.jitsi.videobridge.datachannel;
 
 import org.jitsi.utils.logging2.*;
 import org.jitsi.videobridge.datachannel.protocol.*;
+import org.jitsi.videobridge.metrics.*;
+import org.jitsi.videobridge.sctp.*;
 
 import java.nio.*;
 import java.util.*;
@@ -59,7 +61,14 @@ public class DataChannelStack
         DataChannelMessage message = DataChannelProtocolMessageParser.parse(data.array(), ppid);
         if (message instanceof OpenChannelMessage)
         {
-            logger.info("Received data channel open message");
+            logger.debug("Received data channel open message");
+            if (dataChannels.size() >= SctpConfig.config.getMaxChannels())
+            {
+                logger.warn("Data channel limit exceeded.");
+                VideobridgeMetrics.rejectedDataChannels.inc();
+                return;
+            }
+
             OpenChannelMessage openChannelMessage = (OpenChannelMessage)message;
             // Remote side wants to open a channel
             DataChannel dataChannel = new RemotelyOpenedDataChannel(
@@ -124,7 +133,8 @@ public class DataChannelStack
      */
     public DataChannel createDataChannel(int channelType, int priority, long reliability, int sid, String label)
     {
-        synchronized (dataChannels) {
+        synchronized (dataChannels)
+        {
             DataChannel dataChannel = new DataChannel(
                     dataChannelDataSender, logger, channelType, priority, reliability, sid, label);
             dataChannels.put(sid, dataChannel);

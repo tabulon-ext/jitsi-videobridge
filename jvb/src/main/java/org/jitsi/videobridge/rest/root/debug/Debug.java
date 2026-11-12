@@ -17,22 +17,30 @@
 package org.jitsi.videobridge.rest.root.debug;
 
 import org.jitsi.health.*;
+import org.jitsi.nlj.*;
 import org.jitsi.nlj.transform.node.*;
 import org.jitsi.nlj.transform.node.debug.*;
-import org.jitsi.nlj.util.*;
+import org.jitsi.utils.*;
 import org.jitsi.utils.logging2.*;
 import org.jitsi.utils.logging2.Logger;
 import org.jitsi.utils.queue.*;
 import org.jitsi.videobridge.*;
+import org.jitsi.videobridge.metrics.*;
+import org.jitsi.videobridge.relay.*;
 import org.jitsi.videobridge.rest.*;
 import org.jitsi.videobridge.rest.annotations.*;
 import org.jitsi.videobridge.stats.*;
+import org.jitsi.videobridge.transport.ice.*;
 import org.jitsi.videobridge.util.*;
 import org.jitsi.videobridge.xmpp.*;
 
-import javax.inject.*;
-import javax.ws.rs.*;
-import javax.ws.rs.core.*;
+import jakarta.inject.*;
+import jakarta.ws.rs.*;
+import jakarta.ws.rs.core.*;
+import jakarta.ws.rs.core.MediaType;
+import com.fasterxml.jackson.databind.node.JsonNodeFactory;
+import com.fasterxml.jackson.databind.node.ObjectNode;
+
 import java.net.*;
 
 /**
@@ -82,7 +90,6 @@ public class Debug
         @PathParam("feature") DebugFeatures feature,
         @PathParam("enabled") Boolean enabled)
     {
-        System.out.println("Here with get instead of post!");
         logger.info((enabled ? "Enabling" : "Disabling") + " feature " + feature.getValue());
         setFeature(feature, enabled);
         return Response.ok().build();
@@ -112,7 +119,10 @@ public class Debug
                 return ByteBufferPool.bookkeepingEnabled();
             }
             case QUEUE_STATS: {
-                return PacketQueue.getEnableStatisticsDefault();
+                return QueueStatistics.DEBUG;
+            }
+            case QUEUE_TIMING_STATS: {
+                return QueueStatistics.TRACK_TIMES;
             }
             case NODE_TRACING: {
                 return Node.Companion.isNodeTracingEnabled();
@@ -123,6 +133,9 @@ public class Debug
             }
             case TASK_POOL_STATS: {
                 // Always enabled (worth modeling as a 'feature' then?)
+                return true;
+            }
+            case TOSSED_PACKET_STATS: {
                 return true;
             }
             default: {
@@ -193,6 +206,68 @@ public class Debug
         }
     }
 
+    @POST
+    @Path("/features/relay/{confId}/{rId}/{feature}/{enabled}")
+    public Response setRelayFeatureState(
+        @PathParam("confId") String confId,
+        @PathParam("rId") String rId,
+        @PathParam("feature") EndpointDebugFeatures feature,
+        @PathParam("enabled") Boolean enabled)
+    {
+        Conference conference = videobridge.getConference(confId);
+        if (conference == null)
+        {
+            throw new NotFoundException("No conference was found with the specified id.");
+        }
+
+        Relay relay = conference.getRelay(rId);
+        if (relay == null)
+        {
+            throw new NotFoundException("No relay was found with the specified id.");
+        }
+
+        logger.info("Setting feature state: feature=" + feature.getValue() + ", enabled? " + enabled);
+        try
+        {
+            relay.setFeature(feature, enabled);
+        }
+        catch (IllegalStateException e)
+        {
+            return Response.status(403, e.getMessage()).build();
+        }
+
+        return Response.ok().build();
+    }
+
+    @GET
+    @Path("/features/relay/{confId}/{rId}/{feature}/")
+    public Boolean getRelayFeatureState(
+        @PathParam("confId") String confId,
+        @PathParam("rId") String rId,
+        @PathParam("feature") EndpointDebugFeatures feature)
+    {
+        Conference conference = videobridge.getConference(confId);
+        if (conference == null)
+        {
+            throw new NotFoundException("No conference was found with the specified id.");
+        }
+
+        Relay relay = conference.getRelay(rId);
+        if (relay == null)
+        {
+            throw new NotFoundException("No relay was found with the specified id.");
+        }
+
+        try
+        {
+            return relay.isFeatureEnabled(feature);
+        }
+        catch (Exception e)
+        {
+            throw new ServerErrorException(e.getMessage(), Response.Status.INTERNAL_SERVER_ERROR);
+        }
+    }
+
 
     private void setFeature(DebugFeatures feature, boolean enabled)
     {
@@ -215,7 +290,11 @@ public class Debug
                 break;
             }
             case QUEUE_STATS: {
-                PacketQueue.setEnableStatisticsDefault(enabled);
+                QueueStatistics.DEBUG = enabled;
+                break;
+            }
+            case QUEUE_TIMING_STATS: {
+                QueueStatistics.TRACK_TIMES = enabled;
                 break;
             }
             case NODE_TRACING: {
@@ -242,13 +321,21 @@ public class Debug
     @Produces(MediaType.APPLICATION_JSON)
     public String bridgeDebug(@DefaultValue("false") @QueryParam("full") boolean full)
     {
-        OrderedJsonObject debugState = videobridge.getDebugState(null, null, full);
+        ObjectNode debugState = videobridge.getDebugState(
+                null,
+                null,
+                full ? DebugStateMode.FULL : DebugStateMode.SHORT);
 
         // Append the health status.
-        Exception result = healthCheckService.getResult();
-        debugState.put("health", result == null ? "OK" : result.getMessage());
+        Result result = healthCheckService.getResult();
+        ObjectNode health = JsonNodeFactory.instance.objectNode();
+        health.put("success", result.getSuccess());
+        health.put("hardFailure", result.getHardFailure());
+        health.put("responseCode", result.getResponseCode());
+        health.put("message", result.getMessage());
+        debugState.set("health", health);
 
-        return debugState.toJSONString();
+        return debugState.toString();
     }
 
     @GET
@@ -258,8 +345,11 @@ public class Debug
             @PathParam("confId") String confId,
             @DefaultValue("true") @QueryParam("full") boolean full)
     {
-        OrderedJsonObject confJson = videobridge.getDebugState(confId, null, full);
-        return confJson.toJSONString();
+        ObjectNode confJson = videobridge.getDebugState(
+                confId,
+                null,
+                full ? DebugStateMode.FULL : DebugStateMode.SHORT);
+        return confJson.toString();
     }
 
     @GET
@@ -270,8 +360,11 @@ public class Debug
             @PathParam("epId") String epId,
             @DefaultValue("true") @QueryParam("full") boolean full)
     {
-        OrderedJsonObject confJson = videobridge.getDebugState(confId, epId, full);
-        return confJson.toJSONString();
+        ObjectNode confJson = videobridge.getDebugState(
+                confId,
+                epId,
+                full ? DebugStateMode.FULL : DebugStateMode.SHORT);
+        return confJson.toString();
     }
 
     @GET
@@ -282,25 +375,34 @@ public class Debug
         switch (feature)
         {
             case NODE_STATS: {
-                return StatsKeepingNode.Companion.getStatsJson().toJSONString();
+                return StatsKeepingNode.Companion.getStatsJson().toString();
             }
             case POOL_STATS: {
-                return ByteBufferPool.getStatsJson().toJSONString();
+                return ByteBufferPool.getStatsJson().toString();
             }
             case QUEUE_STATS: {
-                return videobridge.getQueueStats().toJSONString();
+                return QueueStats.getQueueStats().toString();
             }
             case TRANSIT_STATS: {
-                return PacketTransitStats.getStatsJson().toJSONString();
+                return PacketTransitStats.getStatsJson().toString();
             }
             case TASK_POOL_STATS: {
-                return TaskPools.getStatsJson().toJSONString();
+                return TaskPools.getStatsJson().toString();
             }
             case XMPP_DELAY_STATS: {
-                return XmppConnection.getStatsJson().toJSONString();
+                return XmppConnection.getStatsJson().toString();
             }
             case PAYLOAD_VERIFICATION: {
-                return PayloadVerificationPlugin.getStatsJson().toJSONString();
+                return PayloadVerificationPlugin.getStatsJson().toString();
+            }
+            case ICE_STATS: {
+                return IceStatistics.Companion.getStats().toJson().toString();
+            }
+            case CONFERENCE_PACKET_STATS: {
+                return ConferencePacketStats.stats.toJson().toString();
+            }
+            case TOSSED_PACKET_STATS: {
+                return VideobridgeMetrics.tossedPacketsEnergy.get().toString();
             }
             default: {
                 throw new NotFoundException();

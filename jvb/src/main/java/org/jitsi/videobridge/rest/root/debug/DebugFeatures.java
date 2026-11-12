@@ -27,10 +27,14 @@ public enum DebugFeatures
     POOL_STATS("pool-stats"),
     POOL_BOOKKEEPING("pool-bookkeeping"),
     QUEUE_STATS("queue-stats"),
+    QUEUE_TIMING_STATS("queue-timing-stats"),
     TRANSIT_STATS("transit-stats"),
     TASK_POOL_STATS("task-pool-stats"),
     NODE_TRACING("node-tracing"),
-    XMPP_DELAY_STATS("xmpp-delay-stats");
+    ICE_STATS("ice-stats"),
+    XMPP_DELAY_STATS("xmpp-delay-stats"),
+    TOSSED_PACKET_STATS("tossed-packet-stats"),
+    CONFERENCE_PACKET_STATS("conference-packet-stats");
 
     private final String value;
 

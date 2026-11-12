@@ -15,13 +15,15 @@
  */
 package org.jitsi.videobridge.cc.vp9
 
+import com.fasterxml.jackson.databind.node.ArrayNode
+import com.fasterxml.jackson.databind.node.JsonNodeFactory
+import com.fasterxml.jackson.databind.node.ObjectNode
 import org.jitsi.nlj.PacketInfo
 import org.jitsi.nlj.RtpLayerDesc.Companion.indexString
 import org.jitsi.nlj.codec.vpx.VpxUtils.Companion.applyExtendedPictureIdDelta
 import org.jitsi.nlj.codec.vpx.VpxUtils.Companion.applyTl0PicIdxDelta
 import org.jitsi.nlj.codec.vpx.VpxUtils.Companion.getExtendedPictureIdDelta
 import org.jitsi.nlj.codec.vpx.VpxUtils.Companion.getTl0PicIdxDelta
-import org.jitsi.nlj.format.PayloadType
 import org.jitsi.nlj.rtp.codec.vp9.Vp9Packet
 import org.jitsi.rtp.rtcp.RtcpSrPacket
 import org.jitsi.rtp.util.RtpUtils.Companion.applySequenceNumberDelta
@@ -34,10 +36,11 @@ import org.jitsi.utils.logging.TimeSeriesLogger
 import org.jitsi.utils.logging2.Logger
 import org.jitsi.utils.logging2.createChildLogger
 import org.jitsi.videobridge.cc.AdaptiveSourceProjectionContext
+import org.jitsi.videobridge.cc.EncodingLiveness
 import org.jitsi.videobridge.cc.RewriteException
 import org.jitsi.videobridge.cc.RtpState
-import org.json.simple.JSONArray
-import org.json.simple.JSONObject
+import java.time.Duration
+import java.time.Instant
 
 /**
  * This class represents a projection of a VP9 RTP stream
@@ -46,7 +49,6 @@ import org.json.simple.JSONObject
  */
 class Vp9AdaptiveSourceProjectionContext(
     private val diagnosticContext: DiagnosticContext,
-    private val payloadType: PayloadType,
     rtpState: RtpState,
     parentLogger: Logger
 ) : AdaptiveSourceProjectionContext {
@@ -65,20 +67,26 @@ class Vp9AdaptiveSourceProjectionContext(
 
     private var lastVp9FrameProjection = Vp9FrameProjection(
         diagnosticContext,
-        rtpState.ssrc, rtpState.maxSequenceNumber, rtpState.maxTimestamp
+        rtpState.ssrc,
+        rtpState.maxSequenceNumber,
+        rtpState.maxTimestamp
     )
 
+    /**
+     * The picture ID index that started the latest stream resumption.
+     * We can't send frames with picIdIdx less than this, because we don't have
+     * space in the projected sequence number/picId/tl0PicIdx counts.
+     */
+    private var lastPicIdIndexResumption = -1L
+
     @Synchronized
-    override fun accept(
-        packetInfo: PacketInfo,
-        incomingIndex: Int,
-        targetIndex: Int
-    ): Boolean {
+    override fun accept(packetInfo: PacketInfo, targetIndex: Int, liveness: EncodingLiveness): Boolean {
         val packet = packetInfo.packet
         if (packet !is Vp9Packet) {
             logger.warn("Packet is not Vp9 packet")
             return false
         }
+        val incomingEncoding = packet.encodingId
 
         /* If insertPacketInMap returns null, this is a very old picture, more than Vp9PictureMap.PICTURE_MAP_SIZE old,
            or something is wrong with the stream. */
@@ -98,16 +106,20 @@ class Vp9AdaptiveSourceProjectionContext(
                     frame.isKeyframe = false
                 }
             }
-            val receivedMs = packetInfo.receivedTime
+            val receivedTime = packetInfo.receivedTime
             val acceptResult = vp9QualityFilter
-                .acceptFrame(frame, incomingIndex, targetIndex, receivedMs)
-            frame.isAccepted = acceptResult.accept && checkDecodability(frame)
+                .acceptFrame(frame, incomingEncoding, targetIndex, receivedTime, liveness)
+            frame.isAccepted = acceptResult.accept && frameIsProjectable(frame)
             if (frame.isAccepted) {
                 val projection: Vp9FrameProjection
                 try {
                     projection = createProjection(
-                        frame = frame, initialPacket = packet,
-                        isReset = result.isReset, mark = acceptResult.mark, receivedMs = receivedMs
+                        frame = frame,
+                        initialPacket = packet,
+                        isResumption = acceptResult.isResumption,
+                        isReset = result.isReset,
+                        mark = acceptResult.mark,
+                        receivedTime = receivedTime
                     )
                 } catch (e: Exception) {
                     logger.warn("Failed to create frame projection", e)
@@ -122,7 +134,21 @@ class Vp9AdaptiveSourceProjectionContext(
             }
         }
 
-        val accept = frame.isAccepted && frame.projection?.accept(packet) == true
+        val accept = frame.isAccepted &&
+            if (frame.projection?.accept(packet) == true) {
+                true
+            } else {
+                if (frame.projection != null && frame.projection?.closedSeq != -1) {
+                    logger.debug(
+                        "Not accepting $packet: frame projection is closed at ${frame.projection?.closedSeq}"
+                    )
+                } else if (frame.projection == null) {
+                    logger.warn("Not accepting $packet: frame has no projection, even though QF accepted it")
+                } else {
+                    logger.warn("Not accepting $packet, even though frame projection is not closed")
+                }
+                false
+            }
 
         if (timeSeriesLogger.isTraceEnabled) {
             val pt = diagnosticContext.makeTimeSeriesPoint("rtp_vp9")
@@ -130,12 +156,20 @@ class Vp9AdaptiveSourceProjectionContext(
                 .addField("timestamp", packet.timestamp)
                 .addField("seq", packet.sequenceNumber)
                 .addField("pictureId", packet.pictureId)
-                .addField("index", indexString(incomingIndex))
+                .addField("pictureIdIndex", frame.index)
+                .addField("encoding", incomingEncoding)
+                .addField("keyframe", packet.isKeyframe)
+                .addField("spatialLayer", packet.spatialLayerIndex)
+                .addField("temporalLayer", packet.temporalLayerIndex)
                 .addField("isInterPicturePredicted", packet.isInterPicturePredicted)
                 .addField("usesInterLayerDependency", packet.usesInterLayerDependency)
                 .addField("isUpperLevelReference", packet.isUpperLevelReference)
+                .addField("startOfFrame", packet.isStartOfFrame)
+                .addField("endOfFrame", packet.isEndOfFrame)
+                .addField("mark", packet.isMarked)
                 .addField("targetIndex", indexString(targetIndex))
                 .addField("new_frame", result.isNewFrame)
+                .addField("reset", result.isReset)
                 .addField("accept", accept)
             vp9QualityFilter.addDiagnosticContext(pt)
             timeSeriesLogger.trace(pt)
@@ -187,52 +221,39 @@ class Vp9AdaptiveSourceProjectionContext(
         return seqGap
     }
 
-    private fun frameIsNewSsrc(frame: Vp9Frame): Boolean =
-        lastVp9FrameProjection.vp9Frame?.matchesSSRC(frame) != true
+    private fun frameIsNewSsrc(frame: Vp9Frame): Boolean = lastVp9FrameProjection.vp9Frame?.matchesSSRC(frame) != true
+
+    private fun frameIsProjectable(frame: Vp9Frame): Boolean =
+        frameIsNewSsrc(frame) || frame.index >= lastPicIdIndexResumption
 
     /**
      * Find the previous frame before the given one.
      */
     @Synchronized
-    private fun prevFrame(frame: Vp9Frame) =
-        vp9PictureMaps.get(frame.ssrc)?.prevFrame(frame)
+    private fun prevFrame(frame: Vp9Frame) = vp9PictureMaps.get(frame.ssrc)?.prevFrame(frame)
 
     /**
      * Find the next frame after the given one.
      */
     @Synchronized
-    private fun nextFrame(frame: Vp9Frame) =
-        vp9PictureMaps.get(frame.ssrc)?.nextFrame(frame)
+    private fun nextFrame(frame: Vp9Frame) = vp9PictureMaps.get(frame.ssrc)?.nextFrame(frame)
 
     /**
      * Find the previous accepted frame before the given one.
      */
-    private fun findPrevAcceptedFrame(frame: Vp9Frame) =
-        vp9PictureMaps.get(frame.ssrc)?.findPrevAcceptedFrame(frame)
+    private fun findPrevAcceptedFrame(frame: Vp9Frame) = vp9PictureMaps.get(frame.ssrc)?.findPrevAcceptedFrame(frame)
 
     /**
      * Find the next accepted frame after the given one.
      */
-    private fun findNextAcceptedFrame(frame: Vp9Frame) =
-        vp9PictureMaps.get(frame.ssrc)?.findNextAcceptedFrame(frame)
+    private fun findNextAcceptedFrame(frame: Vp9Frame) = vp9PictureMaps.get(frame.ssrc)?.findNextAcceptedFrame(frame)
 
     /**
      * Find a subsequent base-layer TL0 frame after the given frame
      * @param frame The frame to query
      * @return A subsequent base-layer TL0 frame, or null
      */
-    private fun findNextBaseTl0(frame: Vp9Frame) =
-        vp9PictureMaps.get(frame.ssrc)?.findNextBaseTl0(frame)
-
-    /**
-     * For a frame that's been accepted by the quality filter, verify that
-     * it's decodable given the projection decisions about previous frames
-     * (in case the targetIndex has changed).
-     */
-    private fun checkDecodability(frame: Vp9Frame): Boolean {
-        /* TODO - use SS or flexible mode reference list */
-        return true
-    }
+    private fun findNextBaseTl0(frame: Vp9Frame) = vp9PictureMaps.get(frame.ssrc)?.findNextBaseTl0(frame)
 
     /**
      * Create a projection for this frame.
@@ -241,28 +262,32 @@ class Vp9AdaptiveSourceProjectionContext(
         frame: Vp9Frame,
         initialPacket: Vp9Packet,
         mark: Boolean,
+        isResumption: Boolean,
         isReset: Boolean,
-        receivedMs: Long
+        receivedTime: Instant?
     ): Vp9FrameProjection {
         if (frameIsNewSsrc(frame)) {
-            return createEncodingSwitchProjection(frame, initialPacket, mark, receivedMs)
+            return createEncodingSwitchProjection(frame, initialPacket, mark, receivedTime)
         } else if (isReset) {
-            return createResetProjection(frame, initialPacket, mark, receivedMs)
+            return createResetProjection(frame, initialPacket, mark, receivedTime)
+        } else if (isResumption) {
+            return createResumptionProjection(frame, initialPacket, mark, receivedTime)
         }
 
-        return createInEncodingProjection(frame, initialPacket, mark, receivedMs)
+        return createInEncodingProjection(frame, initialPacket, mark, receivedTime)
     }
 
     /**
-     * Create an projection for the first frame after an encoding switch.
+     * Create a projection for the first frame after an encoding switch.
      */
     private fun createEncodingSwitchProjection(
         frame: Vp9Frame,
         initialPacket: Vp9Packet,
         mark: Boolean,
-        receivedMs: Long
+        receivedTime: Instant?
     ): Vp9FrameProjection {
         assert(frame.isKeyframe)
+        lastPicIdIndexResumption = frame.index
 
         var projectedSeqGap = if (!initialPacket.isStartOfFrame) {
             val f = prevFrame(frame)
@@ -297,10 +322,11 @@ class Vp9AdaptiveSourceProjectionContext(
 
         // this is a simulcast switch. The typical incremental value =
         // 90kHz / 30 = 90,000Hz / 30 = 3000 per frame or per 33ms
-        val tsDelta: Long
-        tsDelta = if (lastVp9FrameProjection.createdMs != 0L) {
-            (3000 * Math.max(1, (receivedMs - lastVp9FrameProjection.createdMs) / 33)).toLong()
-        } else {
+        val tsDelta: Long = lastVp9FrameProjection.created?.let { created ->
+            receivedTime?.let {
+                3000 * Math.max(1, Duration.between(created, receivedTime).dividedBy(33).seconds)
+            }
+        } ?: run {
             3000
         }
         val projectedTs = applyTimestampDelta(lastVp9FrameProjection.timestamp, tsDelta)
@@ -330,7 +356,50 @@ class Vp9AdaptiveSourceProjectionContext(
             pictureId = picId,
             tl0PICIDX = tl0PicIdx,
             mark = mark,
-            createdMs = receivedMs
+            created = receivedTime
+        )
+    }
+
+    /**
+     * Create a projection for the first frame after a resumption, i.e. when a source is turned back on.
+     */
+    private fun createResumptionProjection(
+        frame: Vp9Frame,
+        initialPacket: Vp9Packet,
+        mark: Boolean,
+        receivedTime: Instant?
+    ): Vp9FrameProjection {
+        lastPicIdIndexResumption = frame.index
+
+        /* These must be non-null because we don't execute this function unless
+            frameIsNewSsrc and isReset were both false.
+         */
+        val lastFrame = prevFrame(frame)!!
+        val lastProjectedFrame = lastVp9FrameProjection.vp9Frame!!
+
+        /* Project timestamps linearly. */
+        val tsDelta = getTimestampDiff(
+            lastVp9FrameProjection.timestamp,
+            lastProjectedFrame.timestamp
+        )
+        val projectedTs = applyTimestampDelta(frame.timestamp, tsDelta)
+
+        /* Increment picId and tl0picidx by 1 from the last projected frame. */
+        val projectedPicId = applyExtendedPictureIdDelta(lastVp9FrameProjection.pictureId, 1)
+        val projectedTl0PicIdx = applyTl0PicIdxDelta(lastVp9FrameProjection.tl0PICIDX, 1)
+
+        /* Increment sequence numbers based on the last projected frame, but leave a gap
+         * for packet reordering in case this isn't the first packet of the keyframe.
+         */
+        val seqGap = getSequenceNumberDelta(initialPacket.sequenceNumber, lastFrame.latestKnownSequenceNumber)
+        val newSeq = applySequenceNumberDelta(lastVp9FrameProjection.latestProjectedSeqNum, seqGap)
+        val seqDelta = getSequenceNumberDelta(newSeq, initialPacket.sequenceNumber)
+
+        return Vp9FrameProjection(
+            diagnosticContext,
+            frame, lastVp9FrameProjection.ssrc, projectedTs,
+            seqDelta,
+            projectedPicId, projectedTl0PicIdx, mark, receivedTime
         )
     }
 
@@ -341,11 +410,11 @@ class Vp9AdaptiveSourceProjectionContext(
         frame: Vp9Frame,
         initialPacket: Vp9Packet,
         mark: Boolean,
-        receivedMs: Long
+        receivedTime: Instant?
     ): Vp9FrameProjection {
         /* This must be non-null because we don't execute this function unless
             frameIsNewSsrc has returned false.
-        */
+         */
         val lastFrame = lastVp9FrameProjection.vp9Frame!!
 
         /* Apply the latest projected frame's projections out, linearly. */
@@ -374,7 +443,7 @@ class Vp9AdaptiveSourceProjectionContext(
             diagnosticContext,
             frame, lastVp9FrameProjection.ssrc, projectedTs,
             seqDelta,
-            projectedPicId, projectedTl0PicIdx, mark, receivedMs
+            projectedPicId, projectedTl0PicIdx, mark, receivedTime
         )
     }
 
@@ -386,17 +455,17 @@ class Vp9AdaptiveSourceProjectionContext(
         frame: Vp9Frame,
         initialPacket: Vp9Packet,
         mark: Boolean,
-        receivedMs: Long
+        receivedTime: Instant?
     ): Vp9FrameProjection {
         val prevFrame = findPrevAcceptedFrame(frame)
         if (prevFrame != null) {
-            return createInEncodingProjection(frame, prevFrame, initialPacket, mark, receivedMs)
+            return createInEncodingProjection(frame, prevFrame, initialPacket, mark, receivedTime)
         }
 
         /* prev frame has rolled off beginning of frame map, try next frame */
         val nextFrame = findNextAcceptedFrame(frame)
         if (nextFrame != null) {
-            return createInEncodingProjection(frame, nextFrame, initialPacket, mark, receivedMs)
+            return createInEncodingProjection(frame, nextFrame, initialPacket, mark, receivedTime)
         }
 
         /* Neither previous or next is found. Very big frame? Use previous projected.
@@ -404,8 +473,11 @@ class Vp9AdaptiveSourceProjectionContext(
            frameIsNewSsrc has returned false.)
          */
         return createInEncodingProjection(
-            frame, lastVp9FrameProjection.vp9Frame!!,
-            initialPacket, mark, receivedMs
+            frame,
+            lastVp9FrameProjection.vp9Frame!!,
+            initialPacket,
+            mark,
+            receivedTime
         )
     }
 
@@ -418,7 +490,7 @@ class Vp9AdaptiveSourceProjectionContext(
         refFrame: Vp9Frame,
         initialPacket: Vp9Packet,
         mark: Boolean,
-        receivedMs: Long
+        receivedTime: Instant?
     ): Vp9FrameProjection {
         val tsGap = getTimestampDiff(frame.timestamp, refFrame.timestamp)
         val tl0Gap = getTl0PicIdxDelta(frame.tl0PICIDX, refFrame.tl0PICIDX)
@@ -472,17 +544,20 @@ class Vp9AdaptiveSourceProjectionContext(
             pictureId = projectedPicId,
             tl0PICIDX = projectedTl0PicIdx,
             mark = mark,
-            createdMs = receivedMs
+            created = receivedTime
         )
     }
 
-    override fun needsKeyframe(): Boolean {
-        if (vp9QualityFilter.needsKeyframe) {
-            return true
-        }
+    override fun needsKeyframe(): Boolean = vp9QualityFilter.needsKeyframe || needsKeyframeToStart()
 
-        return lastVp9FrameProjection.vp9Frame == null
-    }
+    override fun shouldRequestKeyframe(): Boolean =
+        vp9QualityFilter.shouldRequestKeyframe || (needsKeyframeToStart() && vp9QualityFilter.mayRequestKeyframe)
+
+    /**
+     * Whether a keyframe is needed for a reason of this context's own, not the quality filter's: nothing has been
+     * sent yet.
+     */
+    private fun needsKeyframeToStart(): Boolean = lastVp9FrameProjection.vp9Frame == null
 
     @Throws(RewriteException::class)
     override fun rewriteRtp(packetInfo: PacketInfo) {
@@ -537,26 +612,20 @@ class Vp9AdaptiveSourceProjectionContext(
         lastVp9FrameProjection.timestamp
     )
 
-    override fun getPayloadType(): PayloadType {
-        return payloadType
-    }
-
     @Synchronized
-    override fun getDebugState(): JSONObject {
-        val debugState = JSONObject()
-        debugState["class"] = Vp9AdaptiveSourceProjectionContext::class.java.simpleName
+    override fun getDebugState(): ObjectNode {
+        val debugState = JsonNodeFactory.instance.objectNode()
+        debugState.put("class", Vp9AdaptiveSourceProjectionContext::class.java.simpleName)
 
-        val mapSizes = JSONArray()
+        val mapSizes: ArrayNode = JsonNodeFactory.instance.arrayNode()
         for ((key, value) in vp9PictureMaps.entries) {
-            val sizeInfo = JSONObject()
-            sizeInfo["ssrc"] = key
-            sizeInfo["size"] = value.size()
+            val sizeInfo = JsonNodeFactory.instance.objectNode()
+            sizeInfo.put("ssrc", key)
+            sizeInfo.put("size", value.size())
             mapSizes.add(sizeInfo)
         }
-        debugState["vp9FrameMaps"] = mapSizes
-        debugState["vp9QualityFilter"] = vp9QualityFilter.debugState
-
-        debugState["payloadType"] = payloadType.toString()
+        debugState.set<ObjectNode>("vp9FrameMaps", mapSizes)
+        debugState.set<ObjectNode>("vp9QualityFilter", vp9QualityFilter.debugState)
 
         return debugState
     }

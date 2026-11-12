@@ -16,11 +16,15 @@
 
 package org.jitsi.videobridge.cc.vp9
 
-import io.kotest.matchers.shouldBe
 import io.kotest.core.spec.style.ShouldSpec
+import io.kotest.matchers.shouldBe
 import org.jitsi.nlj.RtpLayerDesc
 import org.jitsi.utils.logging2.LoggerImpl
 import org.jitsi.utils.logging2.getClassForLogging
+import org.jitsi.videobridge.cc.EncodingLiveness
+import org.jitsi.videobridge.cc.EncodingSwitchPolicy
+import org.jitsi.videobridge.cc.liveEncodings
+import java.time.Instant
 
 internal class Vp9QualityFilterTest : ShouldSpec() {
     init {
@@ -30,8 +34,7 @@ internal class Vp9QualityFilterTest : ShouldSpec() {
                 val generator = SingleLayerFrameGenerator()
                 val targetIndex = RtpLayerDesc.getIndex(0, 0, 0)
 
-                testGenerator(generator, filter, targetIndex) {
-                    f, result ->
+                testGenerator(generator, filter, targetIndex) { _, result ->
                     result.accept shouldBe true
                     result.mark shouldBe true
                     filter.needsKeyframe shouldBe false
@@ -45,8 +48,7 @@ internal class Vp9QualityFilterTest : ShouldSpec() {
                 val generator = TemporallyScaledFrameGenerator()
                 val targetIndex = RtpLayerDesc.getIndex(0, 0, 2)
 
-                testGenerator(generator, filter, targetIndex) {
-                    f, result ->
+                testGenerator(generator, filter, targetIndex) { _, result ->
                     result.accept shouldBe true
                     result.mark shouldBe true
                     filter.needsKeyframe shouldBe false
@@ -57,8 +59,7 @@ internal class Vp9QualityFilterTest : ShouldSpec() {
                 val generator = TemporallyScaledFrameGenerator()
                 val targetIndex = RtpLayerDesc.getIndex(0, 0, 0)
 
-                testGenerator(generator, filter, targetIndex) {
-                    f, result ->
+                testGenerator(generator, filter, targetIndex) { f, result ->
                     result.accept shouldBe (f.temporalLayer == 0)
                     if (result.accept) {
                         result.mark shouldBe true
@@ -71,8 +72,7 @@ internal class Vp9QualityFilterTest : ShouldSpec() {
                 val generator = TemporallyScaledFrameGenerator()
                 val targetIndex = RtpLayerDesc.getIndex(0, 0, 1)
 
-                testGenerator(generator, filter, targetIndex) {
-                    f, result ->
+                testGenerator(generator, filter, targetIndex) { f, result ->
                     result.accept shouldBe (f.temporalLayer <= 1)
                     if (result.accept) {
                         result.mark shouldBe true
@@ -94,7 +94,7 @@ internal class Vp9QualityFilterTest : ShouldSpec() {
                 }
                 val targetIndex2 = RtpLayerDesc.getIndex(0, 0, 2)
 
-                testGenerator(generator, filter, targetIndex2) { f, result ->
+                testGenerator(generator, filter, targetIndex2) { _, result ->
                     result.accept shouldBe true
                     result.mark shouldBe true
                     filter.needsKeyframe shouldBe false
@@ -225,7 +225,7 @@ internal class Vp9QualityFilterTest : ShouldSpec() {
                 val targetIndex = RtpLayerDesc.getIndex(0, 1, 2)
 
                 testGenerator(generator, filter, targetIndex) { f, result ->
-                    result.accept shouldBe (f.spatialLayer == 1 || f.spatialLayer < 1 && !f.isInterPicturePredicted)
+                    result.accept shouldBe (f.spatialLayer == 1 || (f.spatialLayer < 1 && !f.isInterPicturePredicted))
                     if (result.accept) {
                         result.mark shouldBe (f.spatialLayer == 1)
                         filter.needsKeyframe shouldBe false
@@ -270,8 +270,11 @@ internal class Vp9QualityFilterTest : ShouldSpec() {
                 testGenerator(generator, filter, targetIndex2, numFrames = 1200) { f, result ->
                     if (f.spatialLayer == 2) sawTargetLayer = true
                     if (f.isKeyframe) sawKeyframe = true
-                    result.accept shouldBe if (!sawKeyframe) (f.spatialLayer == 0) else
+                    result.accept shouldBe if (!sawKeyframe) {
+                        (f.spatialLayer == 0)
+                    } else {
                         (f.spatialLayer == 2 || !f.isInterPicturePredicted)
+                    }
                     if (result.accept) {
                         result.mark shouldBe if (!sawKeyframe) (f.spatialLayer == 0) else (f.spatialLayer == 2)
                         filter.needsKeyframe shouldBe (sawTargetLayer && !sawKeyframe)
@@ -286,9 +289,11 @@ internal class Vp9QualityFilterTest : ShouldSpec() {
                 testGenerator(generator, filter, targetIndex3) { f, result ->
                     if (f.spatialLayer == 1) sawTargetLayer = true
                     if (f.isKeyframe) sawKeyframe = true
-                    result.accept shouldBe if (!sawKeyframe)
-                        ((f.spatialLayer == 2 || !f.isInterPicturePredicted) && f.temporalLayer == 0) else
+                    result.accept shouldBe if (!sawKeyframe) {
+                        ((f.spatialLayer == 2 || !f.isInterPicturePredicted) && f.temporalLayer == 0)
+                    } else {
                         (f.spatialLayer == 1 || (!f.isInterPicturePredicted && f.spatialLayer < 1))
+                    }
                     if (result.accept) {
                         result.mark shouldBe if (!sawKeyframe) (f.spatialLayer == 2) else (f.spatialLayer == 1)
                         filter.needsKeyframe shouldBe !sawKeyframe
@@ -303,11 +308,12 @@ internal class Vp9QualityFilterTest : ShouldSpec() {
                 val generator = SimulcastFrameGenerator()
                 val targetIndex = RtpLayerDesc.getIndex(2, 0, 2)
 
+                /* The first keyframe group is walked up to encoding 2; later groups' lower keyframes are not taken. */
                 testGenerator(generator, filter, targetIndex) { f, result ->
-                    result.accept shouldBe (f.ssrc == 2L || f.isKeyframe)
+                    result.accept shouldBe (f.ssrc == 2L || (f.isKeyframe && f.pictureId == 0))
                     if (result.accept) {
                         result.mark shouldBe true
-                        filter.needsKeyframe shouldBe false
+                        filter.needsKeyframe shouldBe (f.isKeyframe && f.pictureId == 0 && f.ssrc < 2L)
                     }
                 }
             }
@@ -330,10 +336,10 @@ internal class Vp9QualityFilterTest : ShouldSpec() {
                 val targetIndex = RtpLayerDesc.getIndex(1, 0, 2)
 
                 testGenerator(generator, filter, targetIndex) { f, result ->
-                    result.accept shouldBe (f.ssrc == 1L || f.isKeyframe && f.ssrc < 1L)
+                    result.accept shouldBe (f.ssrc == 1L || (f.isKeyframe && f.ssrc == 0L && f.pictureId == 0))
                     if (result.accept) {
                         result.mark shouldBe true
-                        filter.needsKeyframe shouldBe false
+                        filter.needsKeyframe shouldBe (f.isKeyframe && f.pictureId == 0 && f.ssrc < 1L)
                     }
                 }
             }
@@ -343,10 +349,11 @@ internal class Vp9QualityFilterTest : ShouldSpec() {
                 val targetIndex = RtpLayerDesc.getIndex(2, 0, 0)
 
                 testGenerator(generator, filter, targetIndex) { f, result ->
-                    result.accept shouldBe (f.temporalLayer == 0 && (f.ssrc == 2L || f.isKeyframe))
+                    result.accept shouldBe
+                        (f.temporalLayer == 0 && (f.ssrc == 2L || (f.isKeyframe && f.pictureId == 0)))
                     if (result.accept) {
                         result.mark shouldBe true
-                        filter.needsKeyframe shouldBe false
+                        filter.needsKeyframe shouldBe (f.isKeyframe && f.pictureId == 0 && f.ssrc < 2L)
                     }
                 }
             }
@@ -365,32 +372,182 @@ internal class Vp9QualityFilterTest : ShouldSpec() {
                     }
                 }
 
-                /* Switch to encoding 2.  Need a keyframe. */
+                /* Switch to encoding 2.  Need a keyframe. The keyframe group which completes the switch is walked
+                 * up encoding by encoding; later groups' lower keyframes are not taken. */
                 val targetIndex2 = RtpLayerDesc.getIndex(2, 0, 2)
                 var sawKeyframe = false
+                var reachedTarget = false
                 testGenerator(generator, filter, targetIndex2, numFrames = 1200) { f, result ->
                     if (f.isKeyframe) sawKeyframe = true
-                    result.accept shouldBe if (!sawKeyframe) (f.ssrc == 0L) else (f.ssrc == 2L || f.isKeyframe)
+                    result.accept shouldBe if (!sawKeyframe) {
+                        (f.ssrc == 0L)
+                    } else {
+                        (f.ssrc == 2L || (f.isKeyframe && !reachedTarget))
+                    }
+                    if (f.isKeyframe && f.ssrc == 2L) reachedTarget = true
                     if (result.accept) {
                         result.mark shouldBe true
-                        filter.needsKeyframe shouldBe !sawKeyframe
+                        filter.needsKeyframe shouldBe !reachedTarget
                     }
                 }
 
-                /* Switch to encoding 1.  Need a keyframe. */
+                /* Switch to encoding 1.  Need a keyframe. The group's keyframe on encoding 0 is not taken, since
+                 * encoding 1 is being sent and its keyframe is coming. */
                 /* Until the switch is complete we send only TL0. */
                 sawKeyframe = false
+                reachedTarget = false
                 val targetIndex3 = RtpLayerDesc.getIndex(1, 0, 2)
                 testGenerator(generator, filter, targetIndex3) { f, result ->
                     if (f.isKeyframe) sawKeyframe = true
-                    result.accept shouldBe if (!sawKeyframe)
-                        (f.temporalLayer == 0 && (f.ssrc == 2L || f.isKeyframe)) else
-                        (f.ssrc == 1L || (f.isKeyframe && f.ssrc < 1L))
+                    result.accept shouldBe if (!sawKeyframe) {
+                        (f.temporalLayer == 0 && f.ssrc == 2L)
+                    } else {
+                        (f.ssrc == 1L)
+                    }
+                    if (f.isKeyframe && f.ssrc == 1L) reachedTarget = true
                     if (result.accept) {
                         result.mark shouldBe true
-                        filter.needsKeyframe shouldBe !sawKeyframe
+                        filter.needsKeyframe shouldBe !reachedTarget
                     }
                 }
+            }
+        }
+        context("A simulcast source whose sender generates keyframes per encoding") {
+            val enc0 = RtpLayerDesc.getIndex(0, 0, 2)
+            val enc1 = RtpLayerDesc.getIndex(1, 0, 2)
+            val enc2 = RtpLayerDesc.getIndex(2, 0, 2)
+
+            /** Runs the initial keyframe group and 100 pictures more, leaving the filter forwarding [targetIndex]. */
+            fun start(generator: PerEncodingKeyframeGenerator, filter: Vp9QualityFilter, targetIndex: Int) {
+                val targetEncoding = RtpLayerDesc.getEidFromIndex(targetIndex).toLong()
+                testGenerator(generator, filter, targetIndex, numFrames = 300) { f, result ->
+                    result.accept shouldBe (f.ssrc == targetEncoding || (f.isKeyframe && f.ssrc < targetEncoding))
+                }
+                filter.needsKeyframe shouldBe false
+            }
+
+            should("not be demoted by a keyframe on a lower encoding") {
+                val filter = Vp9QualityFilter(logger)
+                val generator = PerEncodingKeyframeGenerator()
+                start(generator, filter, enc1)
+
+                generator.requestKeyframe(0)
+                var sawKeyframe = false
+                testGenerator(generator, filter, enc1, numFrames = 300) { f, result ->
+                    if (f.isKeyframe) sawKeyframe = true
+                    result.accept shouldBe (f.ssrc == 1L)
+                    filter.needsKeyframe shouldBe false
+                }
+                sawKeyframe shouldBe true
+            }
+
+            should("take a keyframe on the encoding being forwarded while a switch down is pending") {
+                val filter = Vp9QualityFilter(logger)
+                val generator = PerEncodingKeyframeGenerator()
+                start(generator, filter, enc1)
+
+                /* Until the encoding 0 keyframe arrives, only TL0 of encoding 1 is forwarded. */
+                testGenerator(generator, filter, enc0, numFrames = 300) { f, result ->
+                    result.accept shouldBe (f.ssrc == 1L && f.temporalLayer == 0)
+                }
+                filter.needsKeyframe shouldBe true
+
+                /* A keyframe on encoding 1 alone is what we're forwarding, so it must be taken, or its successors
+                 * would be undecodable. It doesn't satisfy the need for an encoding 0 keyframe. */
+                generator.requestKeyframe(1)
+                var sawKeyframe = false
+                testGenerator(generator, filter, enc0, numFrames = 300) { f, result ->
+                    if (f.isKeyframe) {
+                        sawKeyframe = true
+                        f.ssrc shouldBe 1L
+                    }
+                    result.accept shouldBe (f.ssrc == 1L && f.temporalLayer == 0)
+                }
+                sawKeyframe shouldBe true
+                filter.needsKeyframe shouldBe true
+
+                generator.requestKeyframe(0)
+                testGenerator(generator, filter, enc0, numFrames = 300) { f, result ->
+                    result.accept shouldBe (f.ssrc == 0L)
+                }
+                filter.needsKeyframe shouldBe false
+            }
+
+            should("complete a switch up on a keyframe for the target encoding alone") {
+                val filter = Vp9QualityFilter(logger)
+                val generator = PerEncodingKeyframeGenerator()
+                start(generator, filter, enc0)
+
+                testGenerator(generator, filter, enc2, numFrames = 300) { f, result ->
+                    result.accept shouldBe (f.ssrc == 0L)
+                }
+                filter.needsKeyframe shouldBe true
+
+                generator.requestKeyframe(2)
+                var sawKeyframe = false
+                testGenerator(generator, filter, enc2, numFrames = 300) { f, result ->
+                    if (f.isKeyframe) {
+                        sawKeyframe = true
+                        f.ssrc shouldBe 2L
+                    }
+                    result.accept shouldBe if (sawKeyframe) (f.ssrc == 2L) else (f.ssrc == 0L)
+                }
+                sawKeyframe shouldBe true
+                filter.needsKeyframe shouldBe false
+            }
+
+            should("not request a keyframe when the target encoding is not being sent") {
+                val filter = Vp9QualityFilter(logger)
+                val generator = PerEncodingKeyframeGenerator()
+                start(generator, filter, enc1)
+
+                generator.stopEncoding(2)
+                val liveness = liveEncodings { it != 2 }
+                testGenerator(generator, filter, enc2, numFrames = 300, liveness = liveness) { f, result ->
+                    result.accept shouldBe (f.ssrc == 1L)
+                    filter.needsKeyframe shouldBe false
+                }
+            }
+
+            should("stop needing a keyframe when the target encoding stops before answering") {
+                val filter = Vp9QualityFilter(logger)
+                val generator = PerEncodingKeyframeGenerator()
+                start(generator, filter, enc1)
+
+                /* The target moves up to encoding 2 while it is being sent: we ask for its keyframe. */
+                testGenerator(generator, filter, enc2, numFrames = 30) { f, result ->
+                    result.accept shouldBe (f.ssrc == 1L)
+                }
+                filter.needsKeyframe shouldBe true
+
+                /* The sender turns encoding 2 off before answering. Encoding 1, which we're forwarding, is now the
+                 * best at or below the target that is being sent, so a keyframe would change nothing: stop asking. */
+                generator.stopEncoding(2)
+                val liveness = liveEncodings { it != 2 }
+                testGenerator(generator, filter, enc2, numFrames = 300, liveness = liveness) { f, result ->
+                    result.accept shouldBe (f.ssrc == 1L)
+                }
+                filter.needsKeyframe shouldBe false
+            }
+
+            should("take a lower keyframe when the encoding being forwarded has stopped") {
+                val filter = Vp9QualityFilter(logger)
+                val generator = PerEncodingKeyframeGenerator()
+                start(generator, filter, enc1)
+
+                generator.stopEncoding(1)
+                val liveness = liveEncodings { it != 1 }
+                testGenerator(generator, filter, enc1, numFrames = 300, liveness = liveness) { _, result ->
+                    result.accept shouldBe false
+                }
+                filter.needsKeyframe shouldBe true
+
+                generator.requestKeyframe(0)
+                testGenerator(generator, filter, enc1, numFrames = 300, liveness = liveness) { f, result ->
+                    result.accept shouldBe (f.ssrc == 0L)
+                }
+                /* Encoding 0 is the best that is being sent, so nothing more to ask for. */
+                filter.needsKeyframe shouldBe false
             }
         }
     }
@@ -400,6 +557,7 @@ internal class Vp9QualityFilterTest : ShouldSpec() {
         filter: Vp9QualityFilter,
         targetIndex: Int,
         numFrames: Int = Int.MAX_VALUE,
+        liveness: EncodingLiveness = EncodingSwitchPolicy.ALL_LIVE,
         evaluator: (Vp9Frame, Vp9QualityFilter.AcceptResult) -> Unit
     ) {
         var lastTs = -1L
@@ -408,16 +566,19 @@ internal class Vp9QualityFilterTest : ShouldSpec() {
         while (g.hasNext() && frames < numFrames) {
             val f = g.next()
 
-            ms = if (f.timestamp != lastTs) { f.timestamp / 90 } else { ms + 1 }
+            ms = if (f.timestamp != lastTs) {
+                f.timestamp / 90
+            } else {
+                ms + 1
+            }
             lastTs = f.timestamp
-
-            val packetIndex = RtpLayerDesc.getIndex(f.ssrc.toInt(), f.spatialLayer, f.temporalLayer)
 
             val result = filter.acceptFrame(
                 frame = f,
+                incomingEncoding = f.ssrc.toInt(),
                 externalTargetIndex = targetIndex,
-                incomingIndex = packetIndex,
-                receivedMs = ms
+                receivedTime = Instant.ofEpochMilli(ms),
+                liveness = liveness
             )
             evaluator(f, result)
             frames++
@@ -433,7 +594,7 @@ private abstract class FrameGenerator : Iterator<Vp9Frame>
 
 /** Generate a non-scalable series of VP9 frames, with a single keyframe at the start. */
 private class SingleLayerFrameGenerator : FrameGenerator() {
-    private val totalPictures = 1000
+    private val totalPictures = 10000
     private var pictureCount = 0
 
     override fun hasNext(): Boolean = pictureCount < totalPictures
@@ -454,7 +615,8 @@ private class SingleLayerFrameGenerator : FrameGenerator() {
             usesInterLayerDependency = false,
             isInterPicturePredicted = (pictureCount > 0),
             pictureId = pictureCount,
-            tl0PICIDX = pictureCount,
+            index = pictureCount.toLong(),
+            tl0PICIDX = pictureCount and 0xff,
             isKeyframe = (pictureCount == 0),
             numSpatialLayers = if (pictureCount == 0) 1 else -1
         )
@@ -465,7 +627,7 @@ private class SingleLayerFrameGenerator : FrameGenerator() {
 
 /** Generate a temporally-scaled series of VP9 frames, with a single keyframe at the start. */
 private class TemporallyScaledFrameGenerator : FrameGenerator() {
-    private val totalPictures = 1000
+    private val totalPictures = 10000
     private var pictureCount = 0
     private var tl0Count = -1
 
@@ -496,7 +658,8 @@ private class TemporallyScaledFrameGenerator : FrameGenerator() {
             usesInterLayerDependency = false,
             isInterPicturePredicted = (pictureCount > 0),
             pictureId = pictureCount,
-            tl0PICIDX = tl0Count,
+            index = pictureCount.toLong(),
+            tl0PICIDX = tl0Count and 0xff,
             isKeyframe = (pictureCount == 0),
             numSpatialLayers = if (pictureCount == 0) 1 else -1
         )
@@ -507,7 +670,7 @@ private class TemporallyScaledFrameGenerator : FrameGenerator() {
 
 /** Generate a spatially-scaled series of VP9 frames, with full spatial dependencies and periodic keyframes. */
 private class SVCFrameGenerator : FrameGenerator() {
-    private val totalPictures = 1000
+    private val totalPictures = 10000
     private var pictureCount = 0
     private var frameCount = 0
     private var tl0Count = -1
@@ -543,7 +706,8 @@ private class SVCFrameGenerator : FrameGenerator() {
             usesInterLayerDependency = sLayer > 0,
             isInterPicturePredicted = !keyframePicture,
             pictureId = pictureCount,
-            tl0PICIDX = tl0Count,
+            index = pictureCount.toLong(),
+            tl0PICIDX = tl0Count and 0xff,
             isKeyframe = keyframePicture && sLayer == 0,
             numSpatialLayers = if (keyframePicture && sLayer == 0) 3 else -1
         )
@@ -559,7 +723,7 @@ private class SVCFrameGenerator : FrameGenerator() {
 
 /** Generate a spatially-scaled series of VP9 frames, with K-SVC spatial dependencies and periodic keyframes. */
 private class KSVCFrameGenerator : FrameGenerator() {
-    private val totalPictures = 1000
+    private val totalPictures = 10000
     private var pictureCount = 0
     private var frameCount = 0
     private var tl0Count = -1
@@ -595,7 +759,8 @@ private class KSVCFrameGenerator : FrameGenerator() {
             usesInterLayerDependency = keyframePicture && sLayer > 0,
             isInterPicturePredicted = !keyframePicture,
             pictureId = pictureCount,
-            tl0PICIDX = tl0Count,
+            index = pictureCount.toLong(),
+            tl0PICIDX = tl0Count and 0xff,
             isKeyframe = keyframePicture && sLayer == 0,
             numSpatialLayers = if (keyframePicture && sLayer == 0) 3 else -1
         )
@@ -633,7 +798,8 @@ private class SimulcastFrameGenerator : FrameGenerator() {
         val keyframePicture = (pictureCount % 48) == 0
 
         val f = Vp9Frame(
-            ssrc = enc.toLong(), /* Use the encoding ID as the SSRC to make testing easier. */
+            // Use the encoding ID as the SSRC to make testing easier.
+            ssrc = enc.toLong(),
             timestamp = pictureCount * 3000L,
             earliestKnownSequenceNumber = pictureCount + (enc * 10000),
             latestKnownSequenceNumber = pictureCount + (enc * 10000),
@@ -647,7 +813,8 @@ private class SimulcastFrameGenerator : FrameGenerator() {
             usesInterLayerDependency = false,
             isInterPicturePredicted = !keyframePicture,
             pictureId = pictureCount,
-            tl0PICIDX = tl0Count,
+            index = pictureCount.toLong(),
+            tl0PICIDX = tl0Count and 0xff,
             isKeyframe = keyframePicture,
             numSpatialLayers = if (keyframePicture) 1 else -1
         )
@@ -658,5 +825,75 @@ private class SimulcastFrameGenerator : FrameGenerator() {
             pictureCount++
         }
         return f
+    }
+}
+
+/**
+ * Generate a simulcast series of VP9 frames from a sender which generates keyframes only when asked, and only on the
+ * encoding asked for. Every encoding starts with a keyframe.
+ */
+private class PerEncodingKeyframeGenerator : FrameGenerator() {
+    private val totalPictures = 10000
+    private var pictureCount = 0
+    private var enc = 0
+    private val keyframeRequested = BooleanArray(3) { true }
+    private val stopped = BooleanArray(3)
+
+    /** Makes the next frame of encoding [encoding] a keyframe. */
+    fun requestKeyframe(encoding: Int) {
+        keyframeRequested[encoding] = true
+    }
+
+    /** Stops generating frames of encoding [encoding]. */
+    fun stopEncoding(encoding: Int) {
+        stopped[encoding] = true
+    }
+
+    override fun hasNext(): Boolean = pictureCount < totalPictures
+
+    override fun next(): Vp9Frame {
+        while (stopped[enc]) {
+            advance()
+        }
+        val keyframe = keyframeRequested[enc]
+        keyframeRequested[enc] = false
+        val tCycle = pictureCount % 4
+        val tLayer = when {
+            keyframe || tCycle == 0 -> 0
+            tCycle == 2 -> 1
+            else -> 2
+        }
+
+        val f = Vp9Frame(
+            // Use the encoding ID as the SSRC to make testing easier.
+            ssrc = enc.toLong(),
+            timestamp = pictureCount * 3000L,
+            earliestKnownSequenceNumber = pictureCount + (enc * 10000),
+            latestKnownSequenceNumber = pictureCount + (enc * 10000),
+            seenStartOfFrame = true,
+            seenEndOfFrame = true,
+            seenMarker = true,
+            temporalLayer = tLayer,
+            spatialLayer = 0,
+            isUpperLevelReference = false,
+            isSwitchingUpPoint = tLayer > 0,
+            usesInterLayerDependency = false,
+            isInterPicturePredicted = !keyframe,
+            pictureId = pictureCount,
+            index = pictureCount.toLong(),
+            tl0PICIDX = pictureCount and 0xff,
+            isKeyframe = keyframe,
+            numSpatialLayers = if (keyframe) 1 else -1
+        )
+        advance()
+        return f
+    }
+
+    private fun advance() {
+        enc++
+        if (enc == 3) {
+            enc = 0
+            pictureCount++
+        }
     }
 }

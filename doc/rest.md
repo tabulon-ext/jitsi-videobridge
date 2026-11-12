@@ -5,7 +5,7 @@ The two interfaces use different ports. The _private_ interface exposes
 HTTP endpoints which are not meant to be publicly accessible (but might be used
 by other components of the infrastructure, e.g. a signaling server), such as:
 
-* The [COLIBRI control interface](rest-colibri.md) (```/colibri/```)
+* The [COLIBRI control interface](rest-colibri2.md) (```/colibri/```)
 * The health-check interface (```/about/health```)
 * The version interface (```/about/version```)
 
@@ -15,12 +15,18 @@ Configuration
 ==============
 
 The following configuration properties can be added to the jitsi-videobridge configuration file (whichever file is 
-passed to `-Dconfig.file` when running the bridge) to control the behavior of the HTTP interfaces
+passed to `-Dconfig.file` when running the bridge, usually `/etc/jitsi/videobridge/jvb.conf`) to control the behavior
+of the HTTP interfaces.
 
 For the _private_ interface, use the following block and values:
 
 ```hocon
 videobridge {
+    apis {
+        rest {
+            enabled = true
+        }
+    }
     http-servers {
         private {
             // The port for the private HTTP interface (or -1 to disable it).  Defaults to 8080.

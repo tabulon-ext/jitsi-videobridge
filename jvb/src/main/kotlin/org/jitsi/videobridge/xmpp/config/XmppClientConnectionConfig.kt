@@ -21,12 +21,10 @@ import com.typesafe.config.ConfigValue
 import org.jitsi.config.JitsiConfig
 import org.jitsi.metaconfig.ConfigException
 import org.jitsi.metaconfig.config
-import org.jitsi.videobridge.stats.StatsCollector
-import org.jitsi.videobridge.stats.config.StatsTransportConfig
 import org.jitsi.xmpp.mucclient.MucClientConfiguration
 import java.time.Duration
 
-class XmppClientConnectionConfig {
+class XmppClientConnectionConfig private constructor() {
     val clientConfigs: List<MucClientConfiguration> by config {
         "org.jitsi.videobridge.xmpp.user."
             .from(JitsiConfig.legacyConfig)
@@ -44,27 +42,34 @@ class XmppClientConnectionConfig {
             }
     }
 
-    private val presenceIntervalProperty: Duration by config {
+    val presenceInterval: Duration by config {
         "videobridge.apis.xmpp-client.presence-interval".from(JitsiConfig.newConfig)
     }
 
     /**
-     * The interval at which presence updates (with updates stats/status) are published. Allow to be overriden by
-     * legacy-style "stats-transports" config.
+     * Whether to filter the statistics.
      */
-    val presenceInterval: Duration = StatsCollector.config.transportConfigs.stream()
-        .filter { tc -> tc is StatsTransportConfig.MucStatsTransportConfig }
-        .map(StatsTransportConfig::interval)
-        .findFirst()
-        .orElse(presenceIntervalProperty)
+    val statsFilterEnabled: Boolean by config {
+        "videobridge.apis.xmpp-client.stats-filter.enabled".from(JitsiConfig.newConfig)
+    }
+
+    /**
+     * The set of statistics to send, when filtering is enabled.
+     */
+    val statsWhitelist: List<String> by config {
+        "videobridge.apis.xmpp-client.stats-filter.whitelist".from(JitsiConfig.newConfig)
+    }
+
+    /**
+     * The size to set for Smack's JID cache
+     */
+    val jidCacheSize: Int by config {
+        "videobridge.apis.xmpp-client.jid-cache-size".from(JitsiConfig.newConfig)
+    }
 
     companion object {
-        /**
-         * The size to set for Smack's JID cache
-         */
-        val jidCacheSize: Int by config {
-            "videobridge.apis.xmpp-client.jid-cache-size".from(JitsiConfig.newConfig)
-        }
+        @JvmField
+        val config = XmppClientConnectionConfig()
     }
 }
 

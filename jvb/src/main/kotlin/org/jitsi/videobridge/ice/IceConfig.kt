@@ -22,42 +22,9 @@ import org.jitsi.config.JitsiConfig
 import org.jitsi.metaconfig.config
 import org.jitsi.metaconfig.from
 import org.jitsi.metaconfig.optionalconfig
+import java.time.Duration
 
-class IceConfig {
-    /**
-     * Is ICE/TCP enabled.
-     */
-    val tcpEnabled: Boolean by config {
-        // The old property is named 'disable', while the new one
-        // is 'enable', so invert the old value
-        "org.jitsi.videobridge.DISABLE_TCP_HARVESTER".from(JitsiConfig.legacyConfig).transformedBy { !it }
-        "videobridge.ice.tcp.enabled".from(JitsiConfig.newConfig)
-    }
-
-    /**
-     * The ICE/TCP port.
-     */
-    val tcpPort: Int by config {
-        "org.jitsi.videobridge.TCP_HARVESTER_PORT".from(JitsiConfig.legacyConfig)
-        "videobridge.ice.tcp.port".from(JitsiConfig.newConfig)
-    }
-
-    /**
-     * The additional port to advertise, or null if none is configured.
-     */
-    val tcpMappedPort: Int? by optionalconfig {
-        "org.jitsi.videobridge.TCP_HARVESTER_MAPPED_PORT".from(JitsiConfig.legacyConfig)
-        "videobridge.ice.tcp.mapped-port".from(JitsiConfig.newConfig)
-    }
-
-    /**
-     * Whether ICE/TCP should use "ssltcp" or not.
-     */
-    val iceSslTcp: Boolean by config {
-        "org.jitsi.videobridge.TCP_HARVESTER_SSLTCP".from(JitsiConfig.legacyConfig)
-        "videobridge.ice.tcp.ssltcp".from(JitsiConfig.newConfig)
-    }
-
+class IceConfig private constructor() {
     /**
      * The ICE UDP port.
      */
@@ -83,14 +50,6 @@ class IceConfig {
             .convertFrom<String> { KeepAliveStrategy.fromString(it) }
     }
 
-    /**
-     * Whether the ice4j "component socket" mode is used.
-     */
-    val useComponentSocket: Boolean by config {
-        "org.jitsi.videobridge.USE_COMPONENT_SOCKET".from(JitsiConfig.legacyConfig)
-        "videobridge.ice.use-component-socket".from(JitsiConfig.newConfig)
-    }
-
     val resolveRemoteCandidates: Boolean by config(
         "videobridge.ice.resolve-remote-candidates".from(JitsiConfig.newConfig)
     )
@@ -103,6 +62,42 @@ class IceConfig {
             .from(JitsiConfig.newConfig)
             .convertFrom<String> { NominationStrategy.fromString(it) }
     }
+
+    /**
+     * Whether to advertise ICE candidates with private IP addresses (RFC1918 IPv4 addresses and
+     * fec0::/10 or fc00::/7 IPv6 addresses) even to endpoints that have not signaled support for private addresses.
+     */
+    val advertisePrivateCandidates: Boolean by config(
+        "videobridge.ice.advertise-private-candidates".from(JitsiConfig.newConfig)
+    )
+
+    /**
+     * Whether ICE restarts are enabled: when an endpoint explicitly requests one (colibri2
+     * `<transport ice-restart="true"/>`), create a second [org.ice4j.ice.Agent] with rotated local credentials
+     * and run it alongside the established one, instead of rejecting the request.
+     */
+    val restartEnabled: Boolean by config(
+        "videobridge.ice.restart.enabled".from(JitsiConfig.newConfig)
+    )
+
+    /**
+     * How long the old [org.ice4j.ice.Agent] is kept alive after an ICE restart has cut over to the new one.
+     * Both Agents keep their sockets during this window, and ice4j routes each packet by the address it came
+     * from, so the endpoint's old-generation checks — which come from its old address — are answered by the old
+     * Agent rather than dropped.
+     */
+    val restartTransitionWindow: Duration by config(
+        "videobridge.ice.restart.transition-window".from(JitsiConfig.newConfig)
+    )
+
+    /**
+     * How long to wait for the new [org.ice4j.ice.Agent] of an ICE restart to connect before giving up on the
+     * restart and keeping the existing Agent. A value that is not positive disables ICE restarts: the new Agent
+     * would be freed before the endpoint could answer it.
+     */
+    val restartTimeout: Duration by config(
+        "videobridge.ice.restart.timeout".from(JitsiConfig.newConfig)
+    )
 
     companion object {
         @JvmField

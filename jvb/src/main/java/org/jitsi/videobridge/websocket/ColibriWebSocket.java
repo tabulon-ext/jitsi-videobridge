@@ -15,17 +15,22 @@
  */
 package org.jitsi.videobridge.websocket;
 
-import org.eclipse.jetty.websocket.api.*;
-import org.jitsi.utils.collections.*;
+import org.eclipse.jetty.websocket.api.Callback;
+import org.eclipse.jetty.websocket.api.Session;
 import org.jitsi.utils.logging2.*;
 import org.jitsi.videobridge.*;
+import org.jitsi.videobridge.util.*;
+import org.jitsi.videobridge.websocket.config.*;
 
+import java.nio.*;
+import java.time.*;
 import java.util.*;
+import java.util.concurrent.*;
 
 /**
  * @author Boris Grozev
  */
-public class ColibriWebSocket extends WebSocketAdapter
+public class ColibriWebSocket implements Session.Listener.AutoDemanding
 {
     /**
      * The logger instance used by this {@link ColibriWebSocket}.
@@ -33,29 +38,39 @@ public class ColibriWebSocket extends WebSocketAdapter
     private final Logger logger;
 
     /**
-     * The {@link ColibriWebSocketServlet} which created this web socket.
-     */
-    private ColibriWebSocketServlet servlet;
-
-    /**
      * The {@link EventHandler}, if any, associated with this web socket.
      */
     private final EventHandler eventHandler;
 
     /**
-     * Initializes a new {@link ColibriWebSocket} instance.
-     * @param servlet the {@link ColibriWebSocketServlet} which created the
-     * instance.
+     * The clock used to compute lastSendTime.
      */
-    ColibriWebSocket(
+    private final Clock clock = Clock.systemUTC();
+
+    /** The last time something was sent on this web socket */
+    private Instant lastSendTime = Instant.MIN;
+
+    /** The recurring task to send pings on the connection, if needed. */
+    private ScheduledFuture<?> pinger = null;
+
+    /** The {@link Session} associated with this socket, set once the upgrade completes. */
+    private volatile Session session;
+
+    /**
+     * Initializes a new {@link ColibriWebSocket} instance.
+     */
+    public ColibriWebSocket(
         String id,
-        ColibriWebSocketServlet servlet,
         EventHandler eventHandler
     )
     {
-        this.logger = new LoggerImpl(getClass().getName(), new LogContext(JMap.of("id", id)));
-        this.servlet = servlet;
+        this.logger = new LoggerImpl(getClass().getName(), new LogContext(Map.of("id", id)));
         this.eventHandler = Objects.requireNonNull(eventHandler, "eventHandler");
+    }
+
+    public Session getSession()
+    {
+        return session;
     }
 
     /**
@@ -70,16 +85,22 @@ public class ColibriWebSocket extends WebSocketAdapter
     }
 
     /**
-     * {@inheritDoc}
-     * </p>
      * Handles the event of this web socket being connected. Finds the
      * destination COLIBRI {@link Endpoint} and authenticates the request
      * based on the password.
      */
     @Override
-    public void onWebSocketConnect(Session sess)
+    public void onWebSocketOpen(Session sess)
     {
-        super.onWebSocketConnect(sess);
+        this.session = sess;
+
+        if (WebsocketServiceConfig.config.getSendKeepalivePings())
+        {
+            pinger = TaskPools.SCHEDULED_POOL.scheduleAtFixedRate(this::maybeSendPing,
+                WebsocketServiceConfig.config.getKeepalivePingInterval().toMillis(),
+                WebsocketServiceConfig.config.getKeepalivePingInterval().toMillis(),
+                TimeUnit.MILLISECONDS);
+        }
 
         eventHandler.webSocketConnected(this);
     }
@@ -90,10 +111,70 @@ public class ColibriWebSocket extends WebSocketAdapter
     @Override
     public void onWebSocketClose(int statusCode, String reason)
     {
+        session = null;
         eventHandler.webSocketClosed(this, statusCode, reason);
+        if (pinger != null)
+        {
+            pinger.cancel(true);
+        }
     }
 
-    public interface EventHandler {
+    public void sendString(String message)
+    {
+        Session s = session;
+        if (s != null)
+        {
+            // We'll use the async version of sendText since this may be called
+            // from multiple threads.  It's just fire-and-forget though, so we
+            // don't wait on the result.
+            s.sendText(message, Callback.NOOP);
+            synchronized (this)
+            {
+                lastSendTime = clock.instant();
+            }
+        }
+    }
+
+    private void maybeSendPing()
+    {
+        try
+        {
+            Instant now = clock.instant();
+            synchronized (this)
+            {
+                if (Duration.between(lastSendTime, now).
+                    compareTo(WebsocketServiceConfig.config.getKeepalivePingInterval()) < 0)
+                {
+                    Session s = session;
+                    if (s != null)
+                    {
+                        s.sendPing(ByteBuffer.allocate(0), Callback.NOOP);
+                        lastSendTime = clock.instant();
+                    }
+                }
+            }
+        }
+        catch (Exception e)
+        {
+            logger.error("Error sending websocket ping", e);
+        }
+    }
+
+    /**
+     * {@inheritDoc}
+     */
+    @Override
+    public void onWebSocketError(Throwable cause)
+    {
+        eventHandler.webSocketError(this, cause);
+        if (pinger != null)
+        {
+            pinger.cancel(true);
+        }
+    }
+
+    public interface EventHandler
+    {
         /**
          * Notifies that a specific {@link ColibriWebSocket}
          * instance associated with it has been closed.
@@ -112,5 +193,12 @@ public class ColibriWebSocket extends WebSocketAdapter
          * @param ws the {@link ColibriWebSocket} from which a message was received.
          */
         void webSocketTextReceived(ColibriWebSocket ws, String message);
+
+        /**
+         * An error occurred for a specific websocket.
+         * @param ws the websocket.
+         * @param cause the cause of the error.
+         */
+        void webSocketError(ColibriWebSocket ws, Throwable cause);
     }
 }

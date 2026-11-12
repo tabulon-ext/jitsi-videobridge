@@ -1,5 +1,6 @@
 /*
  * Copyright @ 2018 - present 8x8, Inc.
+ * Copyright @ 2021 - Vowel, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -13,32 +14,45 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-
 package org.jitsi.videobridge.cc.allocation
 
-import io.kotest.assertions.withClue
 import io.kotest.core.spec.IsolationMode
+import io.kotest.core.spec.Spec
 import io.kotest.core.spec.style.ShouldSpec
+import io.kotest.matchers.collections.shouldContain
 import io.kotest.matchers.collections.shouldContainInOrder
-import io.kotest.matchers.nulls.shouldNotBeNull
+import io.kotest.matchers.longs.shouldBeWithinPercentageOf
 import io.kotest.matchers.shouldBe
+import io.mockk.CapturingSlot
+import io.mockk.every
+import io.mockk.mockk
+import io.mockk.verify
+import org.jitsi.config.setNewConfig
 import org.jitsi.nlj.MediaSourceDesc
 import org.jitsi.nlj.PacketInfo
 import org.jitsi.nlj.RtpEncodingDesc
 import org.jitsi.nlj.RtpLayerDesc
+import org.jitsi.nlj.VideoType
 import org.jitsi.nlj.format.RtxPayloadType
+import org.jitsi.nlj.rtp.SsrcAssociationType.RTX
 import org.jitsi.nlj.rtp.VideoRtpPacket
 import org.jitsi.nlj.util.Bandwidth
 import org.jitsi.nlj.util.bps
 import org.jitsi.nlj.util.kbps
 import org.jitsi.nlj.util.mbps
-import org.jitsi.test.time.FakeClock
+import org.jitsi.utils.concurrent.FakeScheduledExecutorService
 import org.jitsi.utils.logging.DiagnosticContext
 import org.jitsi.utils.logging2.createLogger
 import org.jitsi.utils.ms
 import org.jitsi.utils.secs
+import org.jitsi.utils.time.FakeClock
+import org.jitsi.videobridge.cc.config.BitrateControllerConfig
 import org.jitsi.videobridge.message.ReceiverVideoConstraintsMessage
+import org.jitsi.videobridge.util.TaskPools
 import java.time.Instant
+import java.util.concurrent.ScheduledExecutorService
+import java.util.concurrent.ScheduledFuture
+import java.util.concurrent.TimeUnit
 import java.util.function.Supplier
 
 class BitrateControllerTest : ShouldSpec() {
@@ -46,290 +60,404 @@ class BitrateControllerTest : ShouldSpec() {
 
     private val logger = createLogger()
     private val clock = FakeClock()
-    private val bc = BitrateControllerWrapper("A", "B", "C", "D", clock = clock)
-    private val A: Endpoint = bc.endpoints.find { it.id == "A" }!!
-    private val B: Endpoint = bc.endpoints.find { it.id == "B" }!!
-    private val C: Endpoint = bc.endpoints.find { it.id == "C" }!!
-    private val D: Endpoint = bc.endpoints.find { it.id == "D" }!!
+    private val bc = BitrateControllerWrapper(createEndpoints("A", "B", "C", "D"), clock = clock)
+    private val a = bc.endpoints.find { it.id == "A" }!! as TestEndpoint
+    private val b = bc.endpoints.find { it.id == "B" }!! as TestEndpoint
+    private val c = bc.endpoints.find { it.id == "C" }!! as TestEndpoint
+    private val d = bc.endpoints.find { it.id == "D" }!! as TestEndpoint
+
+    override suspend fun beforeSpec(spec: Spec) = super.beforeSpec(spec).also {
+        // We disable the threshold, causing [BandwidthAllocator] to make a new decision every time BWE changes. This is
+        // because these tests are designed to test the decisions themselves and not necessarily when they are made.
+        setNewConfig(
+            """
+            videobridge.cc {
+              bwe-change-threshold = 0
+              // Effectively disable periodic updates.
+              max-time-between-calculations = 1 hour 
+            }
+            """.trimIndent(),
+            true
+        )
+    }
+
+    override suspend fun afterSpec(spec: Spec) = super.afterSpec(spec).also {
+        bc.bc.expire()
+        setNewConfig("", true)
+    }
 
     init {
+        context("Expire") {
+            val captureDelay = CapturingSlot<Long>()
+            val captureDelayTimeunit = CapturingSlot<TimeUnit>()
+            val captureCancel = CapturingSlot<Boolean>()
+            val executor: ScheduledExecutorService = mockk {
+                every { schedule(any(), capture(captureDelay), capture(captureDelayTimeunit)) } returns mockk {
+                    every { cancel(capture(captureCancel)) } returns true
+                }
+            }
+            val bc = BitrateControllerWrapper(createEndpoints(), clock = clock, scheduler = executor)
+            val delayMs = TimeUnit.MILLISECONDS.convert(captureDelay.captured, captureDelayTimeunit.captured)
+
+            delayMs.shouldBeWithinPercentageOf(
+                BitrateControllerConfig.config.maxTimeBetweenCalculations.toMillis(),
+                10.0
+            )
+
+            captureCancel.isCaptured shouldBe false
+            bc.bc.expire()
+            captureCancel.isCaptured shouldBe true
+        }
+        context("Expire while an update is being rescheduled") {
+            val runnables = mutableListOf<Runnable>()
+            val futures = mutableListOf<ScheduledFuture<*>>()
+            var onSchedule: () -> Unit = {}
+            val executor: ScheduledExecutorService = mockk {
+                every { schedule(any<Runnable>(), any(), any()) } answers {
+                    runnables.add(firstArg())
+                    onSchedule()
+                    mockk<ScheduledFuture<*>>(relaxed = true).also { futures.add(it) }
+                }
+            }
+            val bc = BitrateControllerWrapper(createEndpoints(), clock = clock, scheduler = executor)
+
+            // Expire after the periodic update has checked that it is not expired, but before it has stored the
+            // task it is scheduling (so expire() can only cancel the previous one).
+            onSchedule = { bc.bc.expire() }
+            runnables.last().run()
+
+            verify { futures.last().cancel(false) }
+        }
         context("Prioritization") {
             context("Without selection") {
-                val endpoints = createEndpoints("F", "E", "D", "C", "B", "A")
-                val ordered = prioritize(endpoints)
-                ordered.map { it.id } shouldBe listOf("F", "E", "D", "C", "B", "A")
+                val sources = createSources("s6", "s5", "s4", "s3", "s2", "s1")
+                val ordered = prioritize(sources)
+                ordered.map { it.sourceName } shouldBe listOf("s6", "s5", "s4", "s3", "s2", "s1")
             }
             context("With one selected") {
-                val endpoints = createEndpoints("F", "E", "D", "C", "B", "A")
-                val ordered = prioritize(endpoints, listOf("B"))
-                ordered.map { it.id } shouldBe listOf("B", "F", "E", "D", "C", "A")
+                val sources = createSources("s6", "s5", "s4", "s3", "s2", "s1")
+                val ordered = prioritize(sources, listOf("s2"))
+                ordered.map { it.sourceName } shouldBe listOf("s2", "s6", "s5", "s4", "s3", "s1")
             }
             context("With multiple selected") {
-                val endpoints = createEndpoints("F", "E", "D", "C", "B", "A")
-                val ordered = prioritize(endpoints, listOf("B", "A", "E"))
-                ordered.map { it.id } shouldBe listOf("B", "A", "E", "F", "D", "C")
+                val sources = createSources("s6", "s5", "s4", "s3", "s2", "s1")
+                val ordered = prioritize(sources, listOf("s2", "s1", "s5"))
+                ordered.map { it.sourceName } shouldBe listOf("s2", "s1", "s5", "s6", "s4", "s3")
             }
         }
 
-        context("Signaling with the legacy API") {
-            bc.bc.setSelectedEndpoints(listOf("A", "B", "C", "D"))
-            // Multiple selected endpoints signals tile-view, and in tile-view we actually run with no selected
-            // endpoints.
-            bc.bc.allocationSettings.selectedEndpoints shouldBe emptyList()
-            bc.bc.allocationSettings.videoConstraints["A"] shouldBe VideoConstraints(1080)
-            bc.bc.setMaxFrameHeight(180)
-            bc.bc.allocationSettings.videoConstraints["A"] shouldBe VideoConstraints(180)
+        context("Retargeting receivers' keyframe requests") {
+            val aSource = a.mediaSources[0]
+            // RTX SSRCs, which a receiver's request may name too.
+            aSource.rtpEncodings.forEachIndexed { i, encoding -> encoding.addSecondarySsrc(101L + i, RTX) }
+            bc.setEndpointOrdering(a, b, c, d)
+            bc.setStageView("A-v0")
+            bc.bwe = 10.mbps
+            bc.forwardedSourcesHistory.last().event shouldContain "A-v0"
+            // A is on stage at 10 Mbps, so its target is the 720p encoding, SSRC 3.
+            context("for a source whose target encoding is being sent") {
+                aSource.rtpEncodings.forEach { it.liveness.onPacketReceived(clock.millis()) }
+                should("name the target encoding") {
+                    bc.bc.retargetKeyframeRequest(1L) shouldBe 3L
+                }
+                should("name the target encoding for a request naming an RTX SSRC") {
+                    bc.bc.retargetKeyframeRequest(101L) shouldBe 3L
+                }
+            }
+            context("for a source whose target encoding is not being sent") {
+                aSource.rtpEncodings[0].liveness.onPacketReceived(clock.millis())
+                aSource.rtpEncodings[1].liveness.onPacketReceived(clock.millis())
+                should("name the highest encoding below it which is") {
+                    bc.bc.retargetKeyframeRequest(1L) shouldBe 2L
+                }
+            }
+            context("for a source none of whose encodings are being sent") {
+                should("leave the request on the primary SSRC") {
+                    bc.bc.retargetKeyframeRequest(1L) shouldBe 1L
+                }
+            }
+            context("for a source which is not forwarded to the receiver") {
+                bc.setStageView("A-v0", lastN = 1)
+                bc.bwe = 10.mbps
+                bc.forwardedSourcesHistory.last().event shouldBe setOf("A-v0")
+                b.mediaSources[0].rtpEncodings.forEach { it.liveness.onPacketReceived(clock.millis()) }
+                should("drop the request") {
+                    bc.bc.retargetKeyframeRequest(4L) shouldBe null
+                }
+            }
+            context("for an unknown source") {
+                should("leave the request unchanged") {
+                    bc.bc.retargetKeyframeRequest(9999L) shouldBe 9999L
+                }
+            }
         }
 
         context("Allocation") {
             context("Stage view") {
                 context("When LastN is not set") {
                     context("and the dominant speaker is on stage") {
-                        listOf(true, false).forEach { legacy ->
-                            context("With ${if (legacy) "legacy" else "new"} signaling") {
-                                bc.setEndpointOrdering(A, B, C, D)
-                                bc.setStageView("A", legacy = legacy)
+                        listOf(true, false).forEach { screensharing ->
+                            context("With ${if (screensharing) "screensharing" else "camera"}") {
+                                if (screensharing) {
+                                    a.mediaSources[0].videoType = VideoType.DESKTOP
+                                }
+                                bc.setEndpointOrdering(a, b, c, d)
+                                bc.setStageView("A-v0")
 
                                 bc.bc.allocationSettings.lastN shouldBe -1
-                                bc.bc.allocationSettings.selectedEndpoints shouldBe emptyList()
-                                bc.bc.allocationSettings.onStageEndpoints shouldBe listOf("A")
+                                bc.bc.allocationSettings.selectedSources shouldBe emptyList()
+                                bc.bc.allocationSettings.onStageSources shouldBe listOf("A-v0")
 
                                 runBweLoop()
 
-                                verifyStageView()
+                                verifyStageView(screensharing)
                             }
                         }
                     }
                     context("and a non-dominant speaker is on stage") {
-                        listOf(true, false).forEach { legacy ->
-                            context("With ${if (legacy) "legacy" else "new"} signaling") {
-                                bc.setEndpointOrdering(B, A, C, D)
-                                bc.setStageView("A", legacy = legacy)
+                        bc.setEndpointOrdering(b, a, c, d)
+                        bc.setStageView("A-v0")
 
-                                bc.bc.allocationSettings.lastN shouldBe -1
-                                bc.bc.allocationSettings.selectedEndpoints shouldBe emptyList()
-                                bc.bc.allocationSettings.onStageEndpoints shouldBe listOf("A")
-                                runBweLoop()
+                        bc.bc.allocationSettings.lastN shouldBe -1
+                        bc.bc.allocationSettings.selectedSources shouldBe emptyList()
+                        bc.bc.allocationSettings.onStageSources shouldBe listOf("A-v0")
+                        runBweLoop()
 
-                                verifyStageView()
-                            }
-                        }
+                        verifyStageView()
                     }
+                }
+                context("and the on-stage screenshare does not fit in the available bandwidth") {
+                    // A screenshare with a single expensive layer, i.e. with nothing cheaper for the allocator to
+                    // fall back to. This is what low frame rate screensharing looks like, because the sender only
+                    // activates its highest resolution encoding.
+                    val screenshare = TestEndpoint(
+                        "S",
+                        arrayOf(
+                            MediaSourceDesc(
+                                arrayOf(
+                                    RtpEncodingDesc(
+                                        100L,
+                                        arrayOf(
+                                            MockRtpLayerDesc(
+                                                tid = 0,
+                                                eid = 0,
+                                                height = 1080,
+                                                frameRate = 5.0,
+                                                bitrate = 2000.kbps
+                                            )
+                                        )
+                                    )
+                                ),
+                                sourceName = "S-v0",
+                                owner = "S",
+                                videoType = VideoType.DESKTOP
+                            )
+                        )
+                    )
+                    val bc = BitrateControllerWrapper(listOf(screenshare, b, c), clock = clock)
+                    bc.setStageView("S-v0")
+
+                    // Not enough for the screenshare even with the oversend allowance, though plenty for thumbnails.
+                    bc.bwe = 300.kbps
+
+                    // Nothing is forwarded: bandwidth is reserved for the on-stage source until it reaches its
+                    // "preferred" layer, even when it can not be forwarded at all. This is deliberate, to prevent
+                    // flapping while the estimate ramps up (thumbnails would be enabled here only to be disabled
+                    // when the estimate improves enough for the on-stage source to claim the whole budget).
+                    bc.allocationHistory.last().event.forwardedSources shouldBe emptySet()
                 }
                 context("When LastN=0") {
-                    listOf(true, false).forEach { legacy ->
-                        context("With ${if (legacy) "legacy" else "new"} signaling") {
-                            // LastN=0 is used when the client goes in "audio-only" mode.
-                            bc.setEndpointOrdering(A, B, C, D)
-                            bc.setStageView("A", lastN = 0, legacy = legacy)
+                    // LastN=0 is used when the client goes in "audio-only" mode.
+                    bc.setEndpointOrdering(a, b, c, d)
+                    bc.setStageView("A", lastN = 0)
 
-                            bc.bc.allocationSettings.lastN shouldBe 0
-                            bc.bc.allocationSettings.selectedEndpoints shouldBe emptyList()
-                            bc.bc.allocationSettings.onStageEndpoints shouldBe listOf("A")
+                    bc.bc.allocationSettings.lastN shouldBe 0
+                    bc.bc.allocationSettings.selectedSources shouldBe emptyList()
+                    bc.bc.allocationSettings.onStageSources shouldBe listOf("A")
 
-                            runBweLoop()
+                    runBweLoop()
 
-                            verifyLastN0()
-                        }
-                    }
+                    verifyLastN0()
                 }
                 context("When LastN=1") {
-                    listOf(true, false).forEach { legacy ->
-                        context("With ${if (legacy) "legacy" else "new"} signaling") {
-                            // LastN=1 is used when the client goes in "audio-only" mode, but someone starts a screenshare.
-                            context("and the dominant speaker is on-stage") {
-                                bc.setEndpointOrdering(A, B, C, D)
-                                bc.setStageView("A", lastN = 1, legacy = legacy)
+                    // LastN=1 is used when the client goes in "audio-only" mode, but someone starts a screenshare.
+                    context("and the dominant speaker is on-stage") {
+                        bc.setEndpointOrdering(a, b, c, d)
+                        bc.setStageView("A-v0", lastN = 1)
 
-                                bc.bc.allocationSettings.lastN shouldBe 1
-                                bc.bc.allocationSettings.selectedEndpoints shouldBe emptyList()
-                                bc.bc.allocationSettings.onStageEndpoints shouldBe listOf("A")
+                        bc.bc.allocationSettings.lastN shouldBe 1
+                        bc.bc.allocationSettings.selectedSources shouldBe emptyList()
+                        bc.bc.allocationSettings.onStageSources shouldBe listOf("A-v0")
 
-                                runBweLoop()
+                        runBweLoop()
 
-                                verifyStageViewLastN1()
-                            }
-                        }
+                        verifyStageViewLastN1()
                     }
                     context("and a non-dominant speaker is on stage") {
-                        listOf(true, false).forEach { legacy ->
-                            context("With ${if (legacy) "legacy" else "new"} signaling") {
-                                bc.setEndpointOrdering(B, A, C, D)
-                                bc.setStageView("A", lastN = 1, legacy = legacy)
+                        bc.setEndpointOrdering(b, a, c, d)
+                        bc.setStageView("A-v0", lastN = 1)
 
-                                bc.bc.allocationSettings.lastN shouldBe 1
-                                bc.bc.allocationSettings.selectedEndpoints shouldBe emptyList()
-                                bc.bc.allocationSettings.onStageEndpoints shouldBe listOf("A")
+                        bc.bc.allocationSettings.lastN shouldBe 1
+                        bc.bc.allocationSettings.selectedSources shouldBe emptyList()
+                        bc.bc.allocationSettings.onStageSources shouldBe listOf("A-v0")
 
-                                runBweLoop()
+                        runBweLoop()
 
-                                verifyStageViewLastN1()
-                            }
-                        }
+                        verifyStageViewLastN1()
                     }
                 }
             }
             context("Tile view") {
-                listOf(true, false).forEach { legacy ->
-                    context("With ${if (legacy) "legacy" else "new"} signaling") {
-                        bc.setEndpointOrdering(A, B, C, D)
-                        bc.setTileView("A", "B", "C", "D", legacy = legacy)
+                bc.setEndpointOrdering(a, b, c, d)
+                bc.setTileView("A-v0", "B-v0", "C-v0", "D-v0")
 
-                        bc.bc.allocationSettings.lastN shouldBe -1
-                        // The legacy API (currently used by jitsi-meet) uses "selected count > 0" to infer TileView,
-                        // and in tile view we do not use selected endpoints.
-                        bc.bc.allocationSettings.selectedEndpoints shouldBe
-                            if (legacy) emptyList() else listOf("A", "B", "C", "D")
+                bc.bc.allocationSettings.lastN shouldBe -1
+                bc.bc.allocationSettings.selectedSources shouldBe
+                    listOf("A-v0", "B-v0", "C-v0", "D-v0")
 
-                        context("When LastN is not set") {
-                            runBweLoop()
+                context("When LastN is not set") {
+                    runBweLoop()
 
-                            verifyTileView()
-                        }
-                        context("When LastN=0") {
-                            bc.setTileView("A", "B", "C", "D", lastN = 0, legacy = legacy)
-                            runBweLoop()
+                    verifyTileView()
+                }
+                context("When LastN=0") {
+                    bc.setTileView("A-v0", "B-v0", "C-v0", "D-v0", lastN = 0)
+                    runBweLoop()
 
-                            verifyLastN0()
-                        }
-                        context("When LastN=1") {
-                            bc.setTileView("A", "B", "C", "D", lastN = 1, legacy = legacy)
-                            runBweLoop()
+                    verifyLastN0()
+                }
+                context("When LastN=1") {
+                    bc.setTileView("A-v0", "B-v0", "C-v0", "D-v0", lastN = 1)
+                    runBweLoop()
 
-                            verifyTileViewLastN1()
-                        }
-                    }
+                    verifyTileViewLastN1()
                 }
             }
             context("Tile view 360p") {
-                listOf(true, false).forEach { legacy ->
-                    context("With ${if (legacy) "legacy" else "new"} signaling") {
-                        bc.setEndpointOrdering(A, B, C, D)
-                        bc.setTileView("A", "B", "C", "D", maxFrameHeight = 360, legacy = legacy)
+                bc.setEndpointOrdering(a, b, c, d)
+                bc.setTileView("A-v0", "B-v0", "C-v0", "D-v0", maxFrameHeight = 360)
 
-                        bc.bc.allocationSettings.lastN shouldBe -1
-                        // The legacy API (currently used by jitsi-meet) uses "selected count > 0" to infer TileView,
-                        // and in tile view we do not use selected endpoints.
-                        bc.bc.allocationSettings.selectedEndpoints shouldBe
-                            if (legacy) emptyList() else listOf("A", "B", "C", "D")
+                bc.bc.allocationSettings.lastN shouldBe -1
+                // The legacy API (currently used by jitsi-meet) uses "selected count > 0" to infer TileView,
+                // and in tile view we do not use selected endpoints.
+                bc.bc.allocationSettings.selectedSources shouldBe
+                    listOf("A-v0", "B-v0", "C-v0", "D-v0")
 
-                        context("When LastN is not set") {
-                            runBweLoop()
+                context("When LastN is not set") {
+                    runBweLoop()
 
-                            verifyTileView360p()
-                        }
-                        context("When LastN=0") {
-                            bc.setTileView("A", "B", "C", "D", lastN = 0, maxFrameHeight = 360, legacy = legacy)
-                            runBweLoop()
+                    verifyTileView360p()
+                }
+                context("When LastN=0") {
+                    bc.setTileView("A-v0", "B-v0", "C-v0", "D-v0", lastN = 0, maxFrameHeight = 360)
+                    runBweLoop()
 
-                            verifyLastN0()
-                        }
-                        context("When LastN=1") {
-                            bc.setTileView("A", "B", "C", "D", lastN = 1, maxFrameHeight = 360, legacy = legacy)
-                            runBweLoop()
+                    verifyLastN0()
+                }
+                context("When LastN=1") {
+                    bc.setTileView("A-v0", "B-v0", "C-v0", "D-v0", lastN = 1, maxFrameHeight = 360)
+                    runBweLoop()
 
-                            verifyTileViewLastN1(360)
-                        }
-                    }
+                    verifyTileViewLastN1(360)
                 }
             }
-            context("Selected endpoints should override the dominant speaker (with new signaling)") {
+            context("Selected sources should override the dominant speaker (with new signaling)") {
                 // A is dominant speaker, A and B are selected. With LastN=2 we should always forward the selected
-                // endpoints regardless of who is speaking.
+                // sources regardless of who is speaking.
                 // The exact flow of this scenario was taken from a (non-jitsi-meet) client.
-                bc.setEndpointOrdering(A, B, C, D)
+                bc.setEndpointOrdering(a, b, c, d)
                 bc.bc.setBandwidthAllocationSettings(
                     ReceiverVideoConstraintsMessage(
-                        selectedEndpoints = listOf("A", "B"),
-                        constraints = mapOf("A" to VideoConstraints(720), "B" to VideoConstraints(720))
+                        selectedSources = listOf("A-v0", "B-v0"),
+                        constraints = mapOf("A-v0" to VideoConstraints(720), "B-v0" to VideoConstraints(720))
                     )
                 )
 
                 bc.effectiveConstraintsHistory.last().event shouldBe mapOf(
-                    "A" to VideoConstraints(720),
-                    "B" to VideoConstraints(720),
-                    "C" to VideoConstraints(180),
-                    "D" to VideoConstraints(180)
+                    "A-v0" to VideoConstraints(720),
+                    "B-v0" to VideoConstraints(720),
+                    "C-v0" to VideoConstraints(180),
+                    "D-v0" to VideoConstraints(180)
                 )
 
                 bc.bc.setBandwidthAllocationSettings(ReceiverVideoConstraintsMessage(lastN = 2))
                 bc.effectiveConstraintsHistory.last().event shouldBe mapOf(
-                    "A" to VideoConstraints(720),
-                    "B" to VideoConstraints(720),
-                    "C" to VideoConstraints(0),
-                    "D" to VideoConstraints(0)
+                    "A-v0" to VideoConstraints(720),
+                    "B-v0" to VideoConstraints(720),
+                    "C-v0" to VideoConstraints(0),
+                    "D-v0" to VideoConstraints(0)
                 )
 
                 bc.bc.allocationSettings.lastN shouldBe 2
-                bc.bc.allocationSettings.selectedEndpoints shouldBe listOf("A", "B")
+                bc.bc.allocationSettings.selectedSources shouldBe listOf("A-v0", "B-v0")
 
                 clock.elapse(20.secs)
                 bc.bwe = 10.mbps
-                bc.forwardedEndpointsHistory.last().event.shouldBe(setOf("A", "B"))
+                bc.forwardedSourcesHistory.last().event.shouldBe(setOf("A-v0", "B-v0"))
 
                 clock.elapse(2.secs)
                 // B becomes dominant speaker.
-                bc.setEndpointOrdering(B, A, C, D)
-                bc.forwardedEndpointsHistory.last().event.shouldBe(setOf("A", "B"))
+                bc.setEndpointOrdering(b, a, c, d)
+                bc.forwardedSourcesHistory.last().event.shouldBe(setOf("A-v0", "B-v0"))
 
                 clock.elapse(2.secs)
                 bc.bc.setBandwidthAllocationSettings(
                     ReceiverVideoConstraintsMessage(
-                        constraints = mapOf("A" to VideoConstraints(360), "B" to VideoConstraints(360))
+                        constraints = mapOf("A-v0" to VideoConstraints(360), "B-v0" to VideoConstraints(360))
                     )
                 )
                 bc.effectiveConstraintsHistory.last().event shouldBe mapOf(
-                    "A" to VideoConstraints(360),
-                    "B" to VideoConstraints(360),
-                    "C" to VideoConstraints(0),
-                    "D" to VideoConstraints(0)
+                    "A-v0" to VideoConstraints(360),
+                    "B-v0" to VideoConstraints(360),
+                    "C-v0" to VideoConstraints(0),
+                    "D-v0" to VideoConstraints(0)
                 )
 
                 clock.elapse(2.secs)
                 // This should change nothing, the selection didn't change.
                 bc.bc.setBandwidthAllocationSettings(
-                    ReceiverVideoConstraintsMessage(selectedEndpoints = listOf("A", "B"))
+                    ReceiverVideoConstraintsMessage(selectedSources = listOf("A-v0", "B-v0"))
                 )
-                bc.forwardedEndpointsHistory.last().event.shouldBe(setOf("A", "B"))
+                bc.forwardedSourcesHistory.last().event.shouldBe(setOf("A-v0", "B-v0"))
 
                 clock.elapse(2.secs)
                 bc.bc.setBandwidthAllocationSettings(ReceiverVideoConstraintsMessage(lastN = -1))
                 bc.effectiveConstraintsHistory.last().event shouldBe mapOf(
-                    "A" to VideoConstraints(360),
-                    "B" to VideoConstraints(360),
-                    "C" to VideoConstraints(180),
-                    "D" to VideoConstraints(180)
+                    "A-v0" to VideoConstraints(360),
+                    "B-v0" to VideoConstraints(360),
+                    "C-v0" to VideoConstraints(180),
+                    "D-v0" to VideoConstraints(180)
                 )
-                bc.forwardedEndpointsHistory.last().event.shouldBe(setOf("A", "B", "C", "D"))
+                bc.forwardedSourcesHistory.last().event.shouldBe(setOf("A-v0", "B-v0", "C-v0", "D-v0"))
 
                 bc.bc.setBandwidthAllocationSettings(ReceiverVideoConstraintsMessage(lastN = 2))
                 bc.effectiveConstraintsHistory.last().event shouldBe mapOf(
-                    "A" to VideoConstraints(360),
-                    "B" to VideoConstraints(360),
-                    "C" to VideoConstraints(0),
-                    "D" to VideoConstraints(0)
+                    "A-v0" to VideoConstraints(360),
+                    "B-v0" to VideoConstraints(360),
+                    "C-v0" to VideoConstraints(0),
+                    "D-v0" to VideoConstraints(0)
                 )
                 clock.elapse(2.secs)
-                bc.forwardedEndpointsHistory.last().event.shouldBe(setOf("A", "B"))
+                bc.forwardedSourcesHistory.last().event.shouldBe(setOf("A-v0", "B-v0"))
 
                 clock.elapse(2.secs)
                 // D is now dominant speaker, but it should not override the selected endpoints.
-                bc.setEndpointOrdering(D, B, A, C)
-                bc.forwardedEndpointsHistory.last().event.shouldBe(setOf("A", "B"))
+                bc.setEndpointOrdering(d, b, a, c)
+                bc.forwardedSourcesHistory.last().event.shouldBe(setOf("A-v0", "B-v0"))
 
                 bc.bwe = 10.mbps
-                bc.forwardedEndpointsHistory.last().event.shouldBe(setOf("A", "B"))
+                bc.forwardedSourcesHistory.last().event.shouldBe(setOf("A-v0", "B-v0"))
 
                 clock.elapse(2.secs)
                 bc.bwe = 0.mbps
                 clock.elapse(2.secs)
                 bc.bwe = 10.mbps
-                bc.forwardedEndpointsHistory.last().event.shouldBe(setOf("A", "B"))
+                bc.forwardedSourcesHistory.last().event.shouldBe(setOf("A-v0", "B-v0"))
 
                 clock.elapse(2.secs)
                 // C is now dominant speaker, but it should not override the selected endpoints.
-                bc.setEndpointOrdering(C, D, A, B)
-                bc.forwardedEndpointsHistory.last().event.shouldBe(setOf("A", "B"))
+                bc.setEndpointOrdering(c, d, a, b)
+                bc.forwardedSourcesHistory.last().event.shouldBe(setOf("A-v0", "B-v0"))
             }
         }
     }
@@ -339,27 +467,318 @@ class BitrateControllerTest : ShouldSpec() {
             bc.bwe = bwe.bps
             clock.elapse(100.ms)
         }
-        logger.info("Forwarded endpoints history: ${bc.forwardedEndpointsHistory}")
+        logger.info("Forwarded sources history: ${bc.forwardedSourcesHistory}")
         logger.info("Effective constraints history: ${bc.effectiveConstraintsHistory}")
         logger.info("Allocation history: ${bc.allocationHistory}")
     }
 
-    private fun verifyStageView() {
+    private fun verifyStageViewScreensharing() {
         // At this stage the purpose of this is just to document current behavior.
         // TODO: The results with bwe==-1 are wrong.
-        bc.forwardedEndpointsHistory.removeIf { it.bwe < 0.bps }
-        bc.forwardedEndpointsHistory.map { it.event }.shouldContainInOrder(
-            setOf("A"),
-            setOf("A", "B"),
-            setOf("A", "B", "C"),
-            setOf("A", "B", "C", "D")
+        bc.forwardedSourcesHistory.map { it.event }.shouldContainInOrder(
+            setOf("A-v0"),
+            setOf("A-v0", "B-v0"),
+            setOf("A-v0", "B-v0", "C-v0"),
+            setOf("A-v0", "B-v0", "C-v0", "D-v0")
         )
 
         bc.effectiveConstraintsHistory.last().event shouldBe mapOf(
-            "A" to VideoConstraints(720),
-            "B" to VideoConstraints(180),
-            "C" to VideoConstraints(180),
-            "D" to VideoConstraints(180)
+            "A-v0" to VideoConstraints(720),
+            "B-v0" to VideoConstraints(180),
+            "C-v0" to VideoConstraints(180),
+            "D-v0" to VideoConstraints(180)
+        )
+
+        // At this stage the purpose of this is just to document current behavior.
+        // TODO: the allocations for bwe=-1 are wrong.
+        bc.allocationHistory.removeIf { it.bwe < 0.bps }
+
+        // Note that the thumbnails are enabled once the screenshare has reached full resolution at its cheapest
+        // frame rate (720p/7.5 at 660 kbps; the first thumbnail fits alongside it at bwe=710 kbps), and from then
+        // on the screenshare's frame rate competes with them.
+        bc.allocationHistory.shouldMatchInOrder(
+            Event(
+                0.kbps,
+                BandwidthAllocation(
+                    setOf(
+                        SingleAllocation(a, targetLayer = sd30),
+                        SingleAllocation(b, targetLayer = noVideo),
+                        SingleAllocation(c, targetLayer = noVideo),
+                        SingleAllocation(d, targetLayer = noVideo)
+                    ),
+                    oversending = true
+                )
+            ),
+            Event(
+                160.kbps,
+                BandwidthAllocation(
+                    setOf(
+                        SingleAllocation(a, targetLayer = hd7_5),
+                        SingleAllocation(b, targetLayer = noVideo),
+                        SingleAllocation(c, targetLayer = noVideo),
+                        SingleAllocation(d, targetLayer = noVideo)
+                    ),
+                    oversending = true
+                )
+            ),
+            Event(
+                660.kbps,
+                BandwidthAllocation(
+                    setOf(
+                        SingleAllocation(a, targetLayer = hd7_5),
+                        SingleAllocation(b, targetLayer = noVideo),
+                        SingleAllocation(c, targetLayer = noVideo),
+                        SingleAllocation(d, targetLayer = noVideo)
+                    )
+                )
+            ),
+            Event(
+                710.kbps,
+                BandwidthAllocation(
+                    setOf(
+                        SingleAllocation(a, targetLayer = hd7_5),
+                        SingleAllocation(b, targetLayer = ld7_5),
+                        SingleAllocation(c, targetLayer = noVideo),
+                        SingleAllocation(d, targetLayer = noVideo)
+                    )
+                )
+            ),
+            Event(
+                760.kbps,
+                BandwidthAllocation(
+                    setOf(
+                        SingleAllocation(a, targetLayer = hd7_5),
+                        SingleAllocation(b, targetLayer = ld7_5),
+                        SingleAllocation(c, targetLayer = ld7_5),
+                        SingleAllocation(d, targetLayer = noVideo)
+                    )
+                )
+            ),
+            Event(
+                810.kbps,
+                BandwidthAllocation(
+                    setOf(
+                        SingleAllocation(a, targetLayer = hd7_5),
+                        SingleAllocation(b, targetLayer = ld7_5),
+                        SingleAllocation(c, targetLayer = ld7_5),
+                        SingleAllocation(d, targetLayer = ld7_5)
+                    )
+                )
+            ),
+            Event(
+                860.kbps,
+                BandwidthAllocation(
+                    setOf(
+                        SingleAllocation(a, targetLayer = hd7_5),
+                        SingleAllocation(b, targetLayer = ld15),
+                        SingleAllocation(c, targetLayer = ld7_5),
+                        SingleAllocation(d, targetLayer = ld7_5)
+                    )
+                )
+            ),
+            Event(
+                910.kbps,
+                BandwidthAllocation(
+                    setOf(
+                        SingleAllocation(a, targetLayer = hd7_5),
+                        SingleAllocation(b, targetLayer = ld15),
+                        SingleAllocation(c, targetLayer = ld15),
+                        SingleAllocation(d, targetLayer = ld7_5)
+                    )
+                )
+            ),
+            Event(
+                960.kbps,
+                BandwidthAllocation(
+                    setOf(
+                        SingleAllocation(a, targetLayer = hd7_5),
+                        SingleAllocation(b, targetLayer = ld15),
+                        SingleAllocation(c, targetLayer = ld15),
+                        SingleAllocation(d, targetLayer = ld15)
+                    )
+                )
+            ),
+            Event(
+                1010.kbps,
+                BandwidthAllocation(
+                    setOf(
+                        SingleAllocation(a, targetLayer = hd7_5),
+                        SingleAllocation(b, targetLayer = ld30),
+                        SingleAllocation(c, targetLayer = ld15),
+                        SingleAllocation(d, targetLayer = ld15)
+                    )
+                )
+            ),
+            Event(
+                1060.kbps,
+                BandwidthAllocation(
+                    setOf(
+                        SingleAllocation(a, targetLayer = hd7_5),
+                        SingleAllocation(b, targetLayer = ld30),
+                        SingleAllocation(c, targetLayer = ld30),
+                        SingleAllocation(d, targetLayer = ld15)
+                    )
+                )
+            ),
+            Event(
+                1120.kbps,
+                BandwidthAllocation(
+                    setOf(
+                        SingleAllocation(a, targetLayer = hd7_5),
+                        SingleAllocation(b, targetLayer = ld30),
+                        SingleAllocation(c, targetLayer = ld30),
+                        SingleAllocation(d, targetLayer = ld30)
+                    )
+                )
+            ),
+            Event(
+                1470.kbps,
+                BandwidthAllocation(
+                    setOf(
+                        SingleAllocation(a, targetLayer = hd15),
+                        SingleAllocation(b, targetLayer = ld7_5),
+                        SingleAllocation(c, targetLayer = ld7_5),
+                        SingleAllocation(d, targetLayer = ld7_5)
+                    )
+                )
+            ),
+            Event(
+                1520.kbps,
+                BandwidthAllocation(
+                    setOf(
+                        SingleAllocation(a, targetLayer = hd15),
+                        SingleAllocation(b, targetLayer = ld15),
+                        SingleAllocation(c, targetLayer = ld7_5),
+                        SingleAllocation(d, targetLayer = ld7_5)
+                    )
+                )
+            ),
+            Event(
+                1570.kbps,
+                BandwidthAllocation(
+                    setOf(
+                        SingleAllocation(a, targetLayer = hd15),
+                        SingleAllocation(b, targetLayer = ld15),
+                        SingleAllocation(c, targetLayer = ld15),
+                        SingleAllocation(d, targetLayer = ld7_5)
+                    )
+                )
+            ),
+            Event(
+                1620.kbps,
+                BandwidthAllocation(
+                    setOf(
+                        SingleAllocation(a, targetLayer = hd15),
+                        SingleAllocation(b, targetLayer = ld15),
+                        SingleAllocation(c, targetLayer = ld15),
+                        SingleAllocation(d, targetLayer = ld15)
+                    )
+                )
+            ),
+            Event(
+                1670.kbps,
+                BandwidthAllocation(
+                    setOf(
+                        SingleAllocation(a, targetLayer = hd15),
+                        SingleAllocation(b, targetLayer = ld30),
+                        SingleAllocation(c, targetLayer = ld15),
+                        SingleAllocation(d, targetLayer = ld15)
+                    )
+                )
+            ),
+            Event(
+                1720.kbps,
+                BandwidthAllocation(
+                    setOf(
+                        SingleAllocation(a, targetLayer = hd15),
+                        SingleAllocation(b, targetLayer = ld30),
+                        SingleAllocation(c, targetLayer = ld30),
+                        SingleAllocation(d, targetLayer = ld15)
+                    )
+                )
+            ),
+            Event(
+                1780.kbps,
+                BandwidthAllocation(
+                    setOf(
+                        SingleAllocation(a, targetLayer = hd15),
+                        SingleAllocation(b, targetLayer = ld30),
+                        SingleAllocation(c, targetLayer = ld30),
+                        SingleAllocation(d, targetLayer = ld30)
+                    )
+                )
+            ),
+            Event(
+                2300.kbps,
+                BandwidthAllocation(
+                    setOf(
+                        SingleAllocation(a, targetLayer = hd30),
+                        SingleAllocation(b, targetLayer = ld15),
+                        SingleAllocation(c, targetLayer = ld15),
+                        SingleAllocation(d, targetLayer = ld15)
+                    )
+                )
+            ),
+            Event(
+                2350.kbps,
+                BandwidthAllocation(
+                    setOf(
+                        SingleAllocation(a, targetLayer = hd30),
+                        SingleAllocation(b, targetLayer = ld30),
+                        SingleAllocation(c, targetLayer = ld15),
+                        SingleAllocation(d, targetLayer = ld15)
+                    )
+                )
+            ),
+            Event(
+                2400.kbps,
+                BandwidthAllocation(
+                    setOf(
+                        SingleAllocation(a, targetLayer = hd30),
+                        SingleAllocation(b, targetLayer = ld30),
+                        SingleAllocation(c, targetLayer = ld30),
+                        SingleAllocation(d, targetLayer = ld15)
+                    )
+                )
+            ),
+            Event(
+                2460.kbps,
+                BandwidthAllocation(
+                    setOf(
+                        SingleAllocation(a, targetLayer = hd30),
+                        SingleAllocation(b, targetLayer = ld30),
+                        SingleAllocation(c, targetLayer = ld30),
+                        SingleAllocation(d, targetLayer = ld30)
+                    )
+                )
+            )
+        )
+    }
+
+    private fun verifyStageView(screensharing: Boolean = false) {
+        when (screensharing) {
+            true -> verifyStageViewScreensharing()
+            false -> verifyStageViewCamera()
+        }
+    }
+
+    private fun verifyStageViewCamera() {
+        // At this stage the purpose of this is just to document current behavior.
+        // TODO: The results with bwe==-1 are wrong.
+        bc.forwardedSourcesHistory.removeIf { it.bwe < 0.bps }
+        bc.forwardedSourcesHistory.map { it.event }.shouldContainInOrder(
+            setOf("A-v0"),
+            setOf("A-v0", "B-v0"),
+            setOf("A-v0", "B-v0", "C-v0"),
+            setOf("A-v0", "B-v0", "C-v0", "D-v0")
+        )
+        // TODO add forwarded sources history here
+
+        bc.effectiveConstraintsHistory.last().event shouldBe mapOf(
+            "A-v0" to VideoConstraints(720),
+            "B-v0" to VideoConstraints(180),
+            "C-v0" to VideoConstraints(180),
+            "D-v0" to VideoConstraints(180)
         )
 
         // At this stage the purpose of this is just to document current behavior.
@@ -368,25 +787,13 @@ class BitrateControllerTest : ShouldSpec() {
 
         bc.allocationHistory.shouldMatchInOrder(
             Event(
-                0.kbps,
-                BandwidthAllocation(
-                    setOf(
-                        SingleAllocation("A", targetLayer = ld7_5),
-                        SingleAllocation("B", targetLayer = noVideo),
-                        SingleAllocation("C", targetLayer = noVideo),
-                        SingleAllocation("D", targetLayer = noVideo)
-                    ),
-                    oversending = true
-                )
-            ),
-            Event(
                 50.kbps,
                 BandwidthAllocation(
                     setOf(
-                        SingleAllocation("A", targetLayer = ld7_5),
-                        SingleAllocation("B", targetLayer = noVideo),
-                        SingleAllocation("C", targetLayer = noVideo),
-                        SingleAllocation("D", targetLayer = noVideo)
+                        SingleAllocation(a, targetLayer = ld7_5),
+                        SingleAllocation(b, targetLayer = noVideo),
+                        SingleAllocation(c, targetLayer = noVideo),
+                        SingleAllocation(d, targetLayer = noVideo)
                     ),
                     oversending = false
                 )
@@ -395,10 +802,10 @@ class BitrateControllerTest : ShouldSpec() {
                 100.kbps,
                 BandwidthAllocation(
                     setOf(
-                        SingleAllocation("A", targetLayer = ld15),
-                        SingleAllocation("B", targetLayer = noVideo),
-                        SingleAllocation("C", targetLayer = noVideo),
-                        SingleAllocation("D", targetLayer = noVideo)
+                        SingleAllocation(a, targetLayer = ld15),
+                        SingleAllocation(b, targetLayer = noVideo),
+                        SingleAllocation(c, targetLayer = noVideo),
+                        SingleAllocation(d, targetLayer = noVideo)
                     )
                 )
             ),
@@ -406,10 +813,10 @@ class BitrateControllerTest : ShouldSpec() {
                 150.kbps,
                 BandwidthAllocation(
                     setOf(
-                        SingleAllocation("A", targetLayer = ld30),
-                        SingleAllocation("B", targetLayer = noVideo),
-                        SingleAllocation("C", targetLayer = noVideo),
-                        SingleAllocation("D", targetLayer = noVideo)
+                        SingleAllocation(a, targetLayer = ld30),
+                        SingleAllocation(b, targetLayer = noVideo),
+                        SingleAllocation(c, targetLayer = noVideo),
+                        SingleAllocation(d, targetLayer = noVideo)
                     )
                 )
             ),
@@ -417,10 +824,10 @@ class BitrateControllerTest : ShouldSpec() {
                 500.kbps,
                 BandwidthAllocation(
                     setOf(
-                        SingleAllocation("A", targetLayer = sd30),
-                        SingleAllocation("B", targetLayer = noVideo),
-                        SingleAllocation("C", targetLayer = noVideo),
-                        SingleAllocation("D", targetLayer = noVideo)
+                        SingleAllocation(a, targetLayer = sd30),
+                        SingleAllocation(b, targetLayer = noVideo),
+                        SingleAllocation(c, targetLayer = noVideo),
+                        SingleAllocation(d, targetLayer = noVideo)
                     )
                 )
             ),
@@ -428,10 +835,10 @@ class BitrateControllerTest : ShouldSpec() {
                 550.kbps,
                 BandwidthAllocation(
                     setOf(
-                        SingleAllocation("A", targetLayer = sd30),
-                        SingleAllocation("B", targetLayer = ld7_5),
-                        SingleAllocation("C", targetLayer = noVideo),
-                        SingleAllocation("D", targetLayer = noVideo)
+                        SingleAllocation(a, targetLayer = sd30),
+                        SingleAllocation(b, targetLayer = ld7_5),
+                        SingleAllocation(c, targetLayer = noVideo),
+                        SingleAllocation(d, targetLayer = noVideo)
                     )
                 )
             ),
@@ -439,10 +846,10 @@ class BitrateControllerTest : ShouldSpec() {
                 600.kbps,
                 BandwidthAllocation(
                     setOf(
-                        SingleAllocation("A", targetLayer = sd30),
-                        SingleAllocation("B", targetLayer = ld7_5),
-                        SingleAllocation("C", targetLayer = ld7_5),
-                        SingleAllocation("D", targetLayer = noVideo)
+                        SingleAllocation(a, targetLayer = sd30),
+                        SingleAllocation(b, targetLayer = ld7_5),
+                        SingleAllocation(c, targetLayer = ld7_5),
+                        SingleAllocation(d, targetLayer = noVideo)
                     )
                 )
             ),
@@ -450,10 +857,10 @@ class BitrateControllerTest : ShouldSpec() {
                 650.kbps,
                 BandwidthAllocation(
                     setOf(
-                        SingleAllocation("A", targetLayer = sd30),
-                        SingleAllocation("B", targetLayer = ld7_5),
-                        SingleAllocation("C", targetLayer = ld7_5),
-                        SingleAllocation("D", targetLayer = ld7_5)
+                        SingleAllocation(a, targetLayer = sd30),
+                        SingleAllocation(b, targetLayer = ld7_5),
+                        SingleAllocation(c, targetLayer = ld7_5),
+                        SingleAllocation(d, targetLayer = ld7_5)
                     )
                 )
             ),
@@ -461,10 +868,10 @@ class BitrateControllerTest : ShouldSpec() {
                 700.kbps,
                 BandwidthAllocation(
                     setOf(
-                        SingleAllocation("A", targetLayer = sd30),
-                        SingleAllocation("B", targetLayer = ld15),
-                        SingleAllocation("C", targetLayer = ld7_5),
-                        SingleAllocation("D", targetLayer = ld7_5)
+                        SingleAllocation(a, targetLayer = sd30),
+                        SingleAllocation(b, targetLayer = ld15),
+                        SingleAllocation(c, targetLayer = ld7_5),
+                        SingleAllocation(d, targetLayer = ld7_5)
                     )
                 )
             ),
@@ -472,10 +879,10 @@ class BitrateControllerTest : ShouldSpec() {
                 750.kbps,
                 BandwidthAllocation(
                     setOf(
-                        SingleAllocation("A", targetLayer = sd30),
-                        SingleAllocation("B", targetLayer = ld15),
-                        SingleAllocation("C", targetLayer = ld15),
-                        SingleAllocation("D", targetLayer = ld7_5)
+                        SingleAllocation(a, targetLayer = sd30),
+                        SingleAllocation(b, targetLayer = ld15),
+                        SingleAllocation(c, targetLayer = ld15),
+                        SingleAllocation(d, targetLayer = ld7_5)
                     )
                 )
             ),
@@ -483,10 +890,10 @@ class BitrateControllerTest : ShouldSpec() {
                 800.kbps,
                 BandwidthAllocation(
                     setOf(
-                        SingleAllocation("A", targetLayer = sd30),
-                        SingleAllocation("B", targetLayer = ld15),
-                        SingleAllocation("C", targetLayer = ld15),
-                        SingleAllocation("D", targetLayer = ld15)
+                        SingleAllocation(a, targetLayer = sd30),
+                        SingleAllocation(b, targetLayer = ld15),
+                        SingleAllocation(c, targetLayer = ld15),
+                        SingleAllocation(d, targetLayer = ld15)
                     )
                 )
             ),
@@ -494,10 +901,10 @@ class BitrateControllerTest : ShouldSpec() {
                 850.kbps,
                 BandwidthAllocation(
                     setOf(
-                        SingleAllocation("A", targetLayer = sd30),
-                        SingleAllocation("B", targetLayer = ld30),
-                        SingleAllocation("C", targetLayer = ld15),
-                        SingleAllocation("D", targetLayer = ld15)
+                        SingleAllocation(a, targetLayer = sd30),
+                        SingleAllocation(b, targetLayer = ld30),
+                        SingleAllocation(c, targetLayer = ld15),
+                        SingleAllocation(d, targetLayer = ld15)
                     )
                 )
             ),
@@ -505,10 +912,10 @@ class BitrateControllerTest : ShouldSpec() {
                 900.kbps,
                 BandwidthAllocation(
                     setOf(
-                        SingleAllocation("A", targetLayer = sd30),
-                        SingleAllocation("B", targetLayer = ld30),
-                        SingleAllocation("C", targetLayer = ld30),
-                        SingleAllocation("D", targetLayer = ld15)
+                        SingleAllocation(a, targetLayer = sd30),
+                        SingleAllocation(b, targetLayer = ld30),
+                        SingleAllocation(c, targetLayer = ld30),
+                        SingleAllocation(d, targetLayer = ld15)
                     )
                 )
             ),
@@ -516,10 +923,10 @@ class BitrateControllerTest : ShouldSpec() {
                 960.kbps,
                 BandwidthAllocation(
                     setOf(
-                        SingleAllocation("A", targetLayer = sd30),
-                        SingleAllocation("B", targetLayer = ld30),
-                        SingleAllocation("C", targetLayer = ld30),
-                        SingleAllocation("D", targetLayer = ld30)
+                        SingleAllocation(a, targetLayer = sd30),
+                        SingleAllocation(b, targetLayer = ld30),
+                        SingleAllocation(c, targetLayer = ld30),
+                        SingleAllocation(d, targetLayer = ld30)
                     )
                 )
             ),
@@ -527,10 +934,10 @@ class BitrateControllerTest : ShouldSpec() {
                 2150.kbps,
                 BandwidthAllocation(
                     setOf(
-                        SingleAllocation("A", targetLayer = hd30),
-                        SingleAllocation("B", targetLayer = ld7_5),
-                        SingleAllocation("C", targetLayer = ld7_5),
-                        SingleAllocation("D", targetLayer = ld7_5)
+                        SingleAllocation(a, targetLayer = hd30),
+                        SingleAllocation(b, targetLayer = ld7_5),
+                        SingleAllocation(c, targetLayer = ld7_5),
+                        SingleAllocation(d, targetLayer = ld7_5)
                     )
                 )
             ),
@@ -538,10 +945,10 @@ class BitrateControllerTest : ShouldSpec() {
                 2200.kbps,
                 BandwidthAllocation(
                     setOf(
-                        SingleAllocation("A", targetLayer = hd30),
-                        SingleAllocation("B", targetLayer = ld15),
-                        SingleAllocation("C", targetLayer = ld7_5),
-                        SingleAllocation("D", targetLayer = ld7_5)
+                        SingleAllocation(a, targetLayer = hd30),
+                        SingleAllocation(b, targetLayer = ld15),
+                        SingleAllocation(c, targetLayer = ld7_5),
+                        SingleAllocation(d, targetLayer = ld7_5)
                     )
                 )
             ),
@@ -549,10 +956,10 @@ class BitrateControllerTest : ShouldSpec() {
                 2250.kbps,
                 BandwidthAllocation(
                     setOf(
-                        SingleAllocation("A", targetLayer = hd30),
-                        SingleAllocation("B", targetLayer = ld15),
-                        SingleAllocation("C", targetLayer = ld15),
-                        SingleAllocation("D", targetLayer = ld7_5)
+                        SingleAllocation(a, targetLayer = hd30),
+                        SingleAllocation(b, targetLayer = ld15),
+                        SingleAllocation(c, targetLayer = ld15),
+                        SingleAllocation(d, targetLayer = ld7_5)
                     )
                 )
             ),
@@ -560,10 +967,10 @@ class BitrateControllerTest : ShouldSpec() {
                 2300.kbps,
                 BandwidthAllocation(
                     setOf(
-                        SingleAllocation("A", targetLayer = hd30),
-                        SingleAllocation("B", targetLayer = ld15),
-                        SingleAllocation("C", targetLayer = ld15),
-                        SingleAllocation("D", targetLayer = ld15)
+                        SingleAllocation(a, targetLayer = hd30),
+                        SingleAllocation(b, targetLayer = ld15),
+                        SingleAllocation(c, targetLayer = ld15),
+                        SingleAllocation(d, targetLayer = ld15)
                     )
                 )
             ),
@@ -571,10 +978,10 @@ class BitrateControllerTest : ShouldSpec() {
                 2350.kbps,
                 BandwidthAllocation(
                     setOf(
-                        SingleAllocation("A", targetLayer = hd30),
-                        SingleAllocation("B", targetLayer = ld30),
-                        SingleAllocation("C", targetLayer = ld15),
-                        SingleAllocation("D", targetLayer = ld15)
+                        SingleAllocation(a, targetLayer = hd30),
+                        SingleAllocation(b, targetLayer = ld30),
+                        SingleAllocation(c, targetLayer = ld15),
+                        SingleAllocation(d, targetLayer = ld15)
                     )
                 )
             ),
@@ -582,10 +989,10 @@ class BitrateControllerTest : ShouldSpec() {
                 2400.kbps,
                 BandwidthAllocation(
                     setOf(
-                        SingleAllocation("A", targetLayer = hd30),
-                        SingleAllocation("B", targetLayer = ld30),
-                        SingleAllocation("C", targetLayer = ld30),
-                        SingleAllocation("D", targetLayer = ld15)
+                        SingleAllocation(a, targetLayer = hd30),
+                        SingleAllocation(b, targetLayer = ld30),
+                        SingleAllocation(c, targetLayer = ld30),
+                        SingleAllocation(d, targetLayer = ld15)
                     )
                 )
             ),
@@ -593,10 +1000,10 @@ class BitrateControllerTest : ShouldSpec() {
                 2460.kbps,
                 BandwidthAllocation(
                     setOf(
-                        SingleAllocation("A", targetLayer = hd30),
-                        SingleAllocation("B", targetLayer = ld30),
-                        SingleAllocation("C", targetLayer = ld30),
-                        SingleAllocation("D", targetLayer = ld30)
+                        SingleAllocation(a, targetLayer = hd30),
+                        SingleAllocation(b, targetLayer = ld30),
+                        SingleAllocation(c, targetLayer = ld30),
+                        SingleAllocation(d, targetLayer = ld30)
                     )
                 )
             )
@@ -605,23 +1012,23 @@ class BitrateControllerTest : ShouldSpec() {
 
     private fun verifyLastN0() {
         // No video forwarded even with high BWE.
-        bc.forwardedEndpointsHistory.size shouldBe 0
+        bc.forwardedSourcesHistory.size shouldBe 0
 
         bc.effectiveConstraintsHistory.last().event shouldBe mapOf(
-            "A" to VideoConstraints(0),
-            "B" to VideoConstraints(0),
-            "C" to VideoConstraints(0),
-            "D" to VideoConstraints(0)
+            "A-v0" to VideoConstraints(0),
+            "B-v0" to VideoConstraints(0),
+            "C-v0" to VideoConstraints(0),
+            "D-v0" to VideoConstraints(0)
         )
 
         // TODO: The history contains 3 identical elements, which is probably a bug.
         bc.allocationHistory.last().event.shouldMatch(
             BandwidthAllocation(
                 setOf(
-                    SingleAllocation("A", targetLayer = noVideo),
-                    SingleAllocation("B", targetLayer = noVideo),
-                    SingleAllocation("C", targetLayer = noVideo),
-                    SingleAllocation("D", targetLayer = noVideo)
+                    SingleAllocation(a, targetLayer = noVideo),
+                    SingleAllocation(b, targetLayer = noVideo),
+                    SingleAllocation(c, targetLayer = noVideo),
+                    SingleAllocation(d, targetLayer = noVideo)
                 )
             )
         )
@@ -630,17 +1037,17 @@ class BitrateControllerTest : ShouldSpec() {
     private fun verifyStageViewLastN1() {
         // At this stage the purpose of this is just to document current behavior.
         // TODO: The results with bwe==-1 are wrong.
-        bc.forwardedEndpointsHistory.removeIf { it.bwe < 0.bps }
+        bc.forwardedSourcesHistory.removeIf { it.bwe < 0.bps }
 
-        bc.forwardedEndpointsHistory.map { it.event }.shouldContainInOrder(
-            setOf("A")
+        bc.forwardedSourcesHistory.map { it.event }.shouldContainInOrder(
+            setOf("A-v0")
         )
 
         bc.effectiveConstraintsHistory.last().event shouldBe mapOf(
-            "A" to VideoConstraints(720),
-            "B" to VideoConstraints(0),
-            "C" to VideoConstraints(0),
-            "D" to VideoConstraints(0)
+            "A-v0" to VideoConstraints(720),
+            "B-v0" to VideoConstraints(0),
+            "C-v0" to VideoConstraints(0),
+            "D-v0" to VideoConstraints(0)
         )
 
         // At this stage the purpose of this is just to document current behavior.
@@ -649,37 +1056,24 @@ class BitrateControllerTest : ShouldSpec() {
 
         bc.allocationHistory.shouldMatchInOrder(
             Event(
-                0.kbps,
-                BandwidthAllocation(
-                    setOf(
-                        SingleAllocation("A", targetLayer = ld7_5),
-                        SingleAllocation("B", targetLayer = noVideo),
-                        SingleAllocation("C", targetLayer = noVideo),
-                        SingleAllocation("D", targetLayer = noVideo)
-                    ),
-                    oversending = true
-                )
-            ),
-            Event(
                 50.kbps,
                 BandwidthAllocation(
                     setOf(
-                        SingleAllocation("A", targetLayer = ld7_5),
-                        SingleAllocation("B", targetLayer = noVideo),
-                        SingleAllocation("C", targetLayer = noVideo),
-                        SingleAllocation("D", targetLayer = noVideo)
-                    ),
-                    oversending = false
+                        SingleAllocation(a, targetLayer = ld7_5),
+                        SingleAllocation(b, targetLayer = noVideo),
+                        SingleAllocation(c, targetLayer = noVideo),
+                        SingleAllocation(d, targetLayer = noVideo)
+                    )
                 )
             ),
             Event(
                 100.kbps,
                 BandwidthAllocation(
                     setOf(
-                        SingleAllocation("A", targetLayer = ld15),
-                        SingleAllocation("B", targetLayer = noVideo),
-                        SingleAllocation("C", targetLayer = noVideo),
-                        SingleAllocation("D", targetLayer = noVideo)
+                        SingleAllocation(a, targetLayer = ld15),
+                        SingleAllocation(b, targetLayer = noVideo),
+                        SingleAllocation(c, targetLayer = noVideo),
+                        SingleAllocation(d, targetLayer = noVideo)
                     )
                 )
             ),
@@ -687,10 +1081,10 @@ class BitrateControllerTest : ShouldSpec() {
                 150.kbps,
                 BandwidthAllocation(
                     setOf(
-                        SingleAllocation("A", targetLayer = ld30),
-                        SingleAllocation("B", targetLayer = noVideo),
-                        SingleAllocation("C", targetLayer = noVideo),
-                        SingleAllocation("D", targetLayer = noVideo)
+                        SingleAllocation(a, targetLayer = ld30),
+                        SingleAllocation(b, targetLayer = noVideo),
+                        SingleAllocation(c, targetLayer = noVideo),
+                        SingleAllocation(d, targetLayer = noVideo)
                     )
                 )
             ),
@@ -698,10 +1092,10 @@ class BitrateControllerTest : ShouldSpec() {
                 500.kbps,
                 BandwidthAllocation(
                     setOf(
-                        SingleAllocation("A", targetLayer = sd30),
-                        SingleAllocation("B", targetLayer = noVideo),
-                        SingleAllocation("C", targetLayer = noVideo),
-                        SingleAllocation("D", targetLayer = noVideo)
+                        SingleAllocation(a, targetLayer = sd30),
+                        SingleAllocation(b, targetLayer = noVideo),
+                        SingleAllocation(c, targetLayer = noVideo),
+                        SingleAllocation(d, targetLayer = noVideo)
                     )
                 )
             ),
@@ -709,10 +1103,10 @@ class BitrateControllerTest : ShouldSpec() {
                 2010.kbps,
                 BandwidthAllocation(
                     setOf(
-                        SingleAllocation("A", targetLayer = hd30),
-                        SingleAllocation("B", targetLayer = noVideo),
-                        SingleAllocation("C", targetLayer = noVideo),
-                        SingleAllocation("D", targetLayer = noVideo)
+                        SingleAllocation(a, targetLayer = hd30),
+                        SingleAllocation(b, targetLayer = noVideo),
+                        SingleAllocation(c, targetLayer = noVideo),
+                        SingleAllocation(d, targetLayer = noVideo)
                     )
                 )
             )
@@ -722,12 +1116,12 @@ class BitrateControllerTest : ShouldSpec() {
     private fun verifyTileView() {
         // At this stage the purpose of this is just to document current behavior.
         // TODO: The results with bwe==-1 are wrong.
-        bc.forwardedEndpointsHistory.removeIf { it.bwe < 0.bps }
-        bc.forwardedEndpointsHistory.map { it.event }.shouldContainInOrder(
-            setOf("A"),
-            setOf("A", "B"),
-            setOf("A", "B", "C"),
-            setOf("A", "B", "C", "D")
+        bc.forwardedSourcesHistory.removeIf { it.bwe < 0.bps }
+        bc.forwardedSourcesHistory.map { it.event }.shouldContainInOrder(
+            setOf("A-v0"),
+            setOf("A-v0", "B-v0"),
+            setOf("A-v0", "B-v0", "C-v0"),
+            setOf("A-v0", "B-v0", "C-v0", "D-v0")
         )
 
         bc.allocationHistory.shouldMatchInOrder(
@@ -735,10 +1129,10 @@ class BitrateControllerTest : ShouldSpec() {
                 (-1).bps,
                 BandwidthAllocation(
                     setOf(
-                        SingleAllocation("A", targetLayer = noVideo),
-                        SingleAllocation("B", targetLayer = noVideo),
-                        SingleAllocation("C", targetLayer = noVideo),
-                        SingleAllocation("D", targetLayer = noVideo)
+                        SingleAllocation(a, targetLayer = noVideo),
+                        SingleAllocation(b, targetLayer = noVideo),
+                        SingleAllocation(c, targetLayer = noVideo),
+                        SingleAllocation(d, targetLayer = noVideo)
                     )
                 )
             ),
@@ -746,10 +1140,10 @@ class BitrateControllerTest : ShouldSpec() {
                 50.kbps,
                 BandwidthAllocation(
                     setOf(
-                        SingleAllocation("A", targetLayer = ld7_5),
-                        SingleAllocation("B", targetLayer = noVideo),
-                        SingleAllocation("C", targetLayer = noVideo),
-                        SingleAllocation("D", targetLayer = noVideo)
+                        SingleAllocation(a, targetLayer = ld7_5),
+                        SingleAllocation(b, targetLayer = noVideo),
+                        SingleAllocation(c, targetLayer = noVideo),
+                        SingleAllocation(d, targetLayer = noVideo)
                     )
                 )
             ),
@@ -757,10 +1151,10 @@ class BitrateControllerTest : ShouldSpec() {
                 100.kbps,
                 BandwidthAllocation(
                     setOf(
-                        SingleAllocation("A", targetLayer = ld7_5),
-                        SingleAllocation("B", targetLayer = ld7_5),
-                        SingleAllocation("C", targetLayer = noVideo),
-                        SingleAllocation("D", targetLayer = noVideo)
+                        SingleAllocation(a, targetLayer = ld7_5),
+                        SingleAllocation(b, targetLayer = ld7_5),
+                        SingleAllocation(c, targetLayer = noVideo),
+                        SingleAllocation(d, targetLayer = noVideo)
                     )
                 )
             ),
@@ -768,10 +1162,10 @@ class BitrateControllerTest : ShouldSpec() {
                 150.kbps,
                 BandwidthAllocation(
                     setOf(
-                        SingleAllocation("A", targetLayer = ld7_5),
-                        SingleAllocation("B", targetLayer = ld7_5),
-                        SingleAllocation("C", targetLayer = ld7_5),
-                        SingleAllocation("D", targetLayer = noVideo)
+                        SingleAllocation(a, targetLayer = ld7_5),
+                        SingleAllocation(b, targetLayer = ld7_5),
+                        SingleAllocation(c, targetLayer = ld7_5),
+                        SingleAllocation(d, targetLayer = noVideo)
                     )
                 )
             ),
@@ -779,10 +1173,10 @@ class BitrateControllerTest : ShouldSpec() {
                 200.kbps,
                 BandwidthAllocation(
                     setOf(
-                        SingleAllocation("A", targetLayer = ld7_5),
-                        SingleAllocation("B", targetLayer = ld7_5),
-                        SingleAllocation("C", targetLayer = ld7_5),
-                        SingleAllocation("D", targetLayer = ld7_5)
+                        SingleAllocation(a, targetLayer = ld7_5),
+                        SingleAllocation(b, targetLayer = ld7_5),
+                        SingleAllocation(c, targetLayer = ld7_5),
+                        SingleAllocation(d, targetLayer = ld7_5)
                     )
                 )
             ),
@@ -790,10 +1184,10 @@ class BitrateControllerTest : ShouldSpec() {
                 250.kbps,
                 BandwidthAllocation(
                     setOf(
-                        SingleAllocation("A", targetLayer = ld15),
-                        SingleAllocation("B", targetLayer = ld7_5),
-                        SingleAllocation("C", targetLayer = ld7_5),
-                        SingleAllocation("D", targetLayer = ld7_5)
+                        SingleAllocation(a, targetLayer = ld15),
+                        SingleAllocation(b, targetLayer = ld7_5),
+                        SingleAllocation(c, targetLayer = ld7_5),
+                        SingleAllocation(d, targetLayer = ld7_5)
                     )
                 )
             ),
@@ -801,10 +1195,10 @@ class BitrateControllerTest : ShouldSpec() {
                 300.kbps,
                 BandwidthAllocation(
                     setOf(
-                        SingleAllocation("A", targetLayer = ld15),
-                        SingleAllocation("B", targetLayer = ld15),
-                        SingleAllocation("C", targetLayer = ld7_5),
-                        SingleAllocation("D", targetLayer = ld7_5)
+                        SingleAllocation(a, targetLayer = ld15),
+                        SingleAllocation(b, targetLayer = ld15),
+                        SingleAllocation(c, targetLayer = ld7_5),
+                        SingleAllocation(d, targetLayer = ld7_5)
                     )
                 )
             ),
@@ -812,10 +1206,10 @@ class BitrateControllerTest : ShouldSpec() {
                 350.kbps,
                 BandwidthAllocation(
                     setOf(
-                        SingleAllocation("A", targetLayer = ld15),
-                        SingleAllocation("B", targetLayer = ld15),
-                        SingleAllocation("C", targetLayer = ld15),
-                        SingleAllocation("D", targetLayer = ld7_5)
+                        SingleAllocation(a, targetLayer = ld15),
+                        SingleAllocation(b, targetLayer = ld15),
+                        SingleAllocation(c, targetLayer = ld15),
+                        SingleAllocation(d, targetLayer = ld7_5)
                     )
                 )
             ),
@@ -823,10 +1217,10 @@ class BitrateControllerTest : ShouldSpec() {
                 400.kbps,
                 BandwidthAllocation(
                     setOf(
-                        SingleAllocation("A", targetLayer = ld15),
-                        SingleAllocation("B", targetLayer = ld15),
-                        SingleAllocation("C", targetLayer = ld15),
-                        SingleAllocation("D", targetLayer = ld15)
+                        SingleAllocation(a, targetLayer = ld15),
+                        SingleAllocation(b, targetLayer = ld15),
+                        SingleAllocation(c, targetLayer = ld15),
+                        SingleAllocation(d, targetLayer = ld15)
                     )
                 )
             ),
@@ -834,10 +1228,10 @@ class BitrateControllerTest : ShouldSpec() {
                 450.kbps,
                 BandwidthAllocation(
                     setOf(
-                        SingleAllocation("A", targetLayer = ld30),
-                        SingleAllocation("B", targetLayer = ld15),
-                        SingleAllocation("C", targetLayer = ld15),
-                        SingleAllocation("D", targetLayer = ld15)
+                        SingleAllocation(a, targetLayer = ld30),
+                        SingleAllocation(b, targetLayer = ld15),
+                        SingleAllocation(c, targetLayer = ld15),
+                        SingleAllocation(d, targetLayer = ld15)
                     )
                 )
             ),
@@ -845,10 +1239,10 @@ class BitrateControllerTest : ShouldSpec() {
                 500.kbps,
                 BandwidthAllocation(
                     setOf(
-                        SingleAllocation("A", targetLayer = ld30),
-                        SingleAllocation("B", targetLayer = ld30),
-                        SingleAllocation("C", targetLayer = ld15),
-                        SingleAllocation("D", targetLayer = ld15)
+                        SingleAllocation(a, targetLayer = ld30),
+                        SingleAllocation(b, targetLayer = ld30),
+                        SingleAllocation(c, targetLayer = ld15),
+                        SingleAllocation(d, targetLayer = ld15)
                     )
                 )
             ),
@@ -856,10 +1250,10 @@ class BitrateControllerTest : ShouldSpec() {
                 550.kbps,
                 BandwidthAllocation(
                     setOf(
-                        SingleAllocation("A", targetLayer = ld30),
-                        SingleAllocation("B", targetLayer = ld30),
-                        SingleAllocation("C", targetLayer = ld30),
-                        SingleAllocation("D", targetLayer = ld15)
+                        SingleAllocation(a, targetLayer = ld30),
+                        SingleAllocation(b, targetLayer = ld30),
+                        SingleAllocation(c, targetLayer = ld30),
+                        SingleAllocation(d, targetLayer = ld15)
                     )
                 )
             ),
@@ -867,10 +1261,10 @@ class BitrateControllerTest : ShouldSpec() {
                 610.kbps,
                 BandwidthAllocation(
                     setOf(
-                        SingleAllocation("A", targetLayer = ld30),
-                        SingleAllocation("B", targetLayer = ld30),
-                        SingleAllocation("C", targetLayer = ld30),
-                        SingleAllocation("D", targetLayer = ld30)
+                        SingleAllocation(a, targetLayer = ld30),
+                        SingleAllocation(b, targetLayer = ld30),
+                        SingleAllocation(c, targetLayer = ld30),
+                        SingleAllocation(d, targetLayer = ld30)
                     )
                 )
             )
@@ -880,12 +1274,12 @@ class BitrateControllerTest : ShouldSpec() {
     private fun verifyTileView360p() {
         // At this stage the purpose of this is just to document current behavior.
         // TODO: The results with bwe==-1 are wrong.
-        bc.forwardedEndpointsHistory.removeIf { it.bwe < 0.bps }
-        bc.forwardedEndpointsHistory.map { it.event }.shouldContainInOrder(
-            setOf("A"),
-            setOf("A", "B"),
-            setOf("A", "B", "C"),
-            setOf("A", "B", "C", "D")
+        bc.forwardedSourcesHistory.removeIf { it.bwe < 0.bps }
+        bc.forwardedSourcesHistory.map { it.event }.shouldContainInOrder(
+            setOf("A-v0"),
+            setOf("A-v0", "B-v0"),
+            setOf("A-v0", "B-v0", "C-v0"),
+            setOf("A-v0", "B-v0", "C-v0", "D-v0")
         )
 
         bc.allocationHistory.shouldMatchInOrder(
@@ -893,10 +1287,10 @@ class BitrateControllerTest : ShouldSpec() {
                 (-1).bps,
                 BandwidthAllocation(
                     setOf(
-                        SingleAllocation("A", targetLayer = noVideo),
-                        SingleAllocation("B", targetLayer = noVideo),
-                        SingleAllocation("C", targetLayer = noVideo),
-                        SingleAllocation("D", targetLayer = noVideo)
+                        SingleAllocation(a, targetLayer = noVideo),
+                        SingleAllocation(b, targetLayer = noVideo),
+                        SingleAllocation(c, targetLayer = noVideo),
+                        SingleAllocation(d, targetLayer = noVideo)
                     )
                 )
             ),
@@ -904,10 +1298,10 @@ class BitrateControllerTest : ShouldSpec() {
                 50.kbps,
                 BandwidthAllocation(
                     setOf(
-                        SingleAllocation("A", targetLayer = ld7_5),
-                        SingleAllocation("B", targetLayer = noVideo),
-                        SingleAllocation("C", targetLayer = noVideo),
-                        SingleAllocation("D", targetLayer = noVideo)
+                        SingleAllocation(a, targetLayer = ld7_5),
+                        SingleAllocation(b, targetLayer = noVideo),
+                        SingleAllocation(c, targetLayer = noVideo),
+                        SingleAllocation(d, targetLayer = noVideo)
                     ),
                     oversending = false
                 )
@@ -916,10 +1310,10 @@ class BitrateControllerTest : ShouldSpec() {
                 100.kbps,
                 BandwidthAllocation(
                     setOf(
-                        SingleAllocation("A", targetLayer = ld7_5),
-                        SingleAllocation("B", targetLayer = ld7_5),
-                        SingleAllocation("C", targetLayer = noVideo),
-                        SingleAllocation("D", targetLayer = noVideo)
+                        SingleAllocation(a, targetLayer = ld7_5),
+                        SingleAllocation(b, targetLayer = ld7_5),
+                        SingleAllocation(c, targetLayer = noVideo),
+                        SingleAllocation(d, targetLayer = noVideo)
                     )
                 )
             ),
@@ -927,10 +1321,10 @@ class BitrateControllerTest : ShouldSpec() {
                 150.kbps,
                 BandwidthAllocation(
                     setOf(
-                        SingleAllocation("A", targetLayer = ld7_5),
-                        SingleAllocation("B", targetLayer = ld7_5),
-                        SingleAllocation("C", targetLayer = ld7_5),
-                        SingleAllocation("D", targetLayer = noVideo)
+                        SingleAllocation(a, targetLayer = ld7_5),
+                        SingleAllocation(b, targetLayer = ld7_5),
+                        SingleAllocation(c, targetLayer = ld7_5),
+                        SingleAllocation(d, targetLayer = noVideo)
                     )
                 )
             ),
@@ -938,10 +1332,10 @@ class BitrateControllerTest : ShouldSpec() {
                 200.kbps,
                 BandwidthAllocation(
                     setOf(
-                        SingleAllocation("A", targetLayer = ld7_5),
-                        SingleAllocation("B", targetLayer = ld7_5),
-                        SingleAllocation("C", targetLayer = ld7_5),
-                        SingleAllocation("D", targetLayer = ld7_5)
+                        SingleAllocation(a, targetLayer = ld7_5),
+                        SingleAllocation(b, targetLayer = ld7_5),
+                        SingleAllocation(c, targetLayer = ld7_5),
+                        SingleAllocation(d, targetLayer = ld7_5)
                     )
                 )
             ),
@@ -949,10 +1343,10 @@ class BitrateControllerTest : ShouldSpec() {
                 250.kbps,
                 BandwidthAllocation(
                     setOf(
-                        SingleAllocation("A", targetLayer = ld15),
-                        SingleAllocation("B", targetLayer = ld7_5),
-                        SingleAllocation("C", targetLayer = ld7_5),
-                        SingleAllocation("D", targetLayer = ld7_5)
+                        SingleAllocation(a, targetLayer = ld15),
+                        SingleAllocation(b, targetLayer = ld7_5),
+                        SingleAllocation(c, targetLayer = ld7_5),
+                        SingleAllocation(d, targetLayer = ld7_5)
                     )
                 )
             ),
@@ -960,10 +1354,10 @@ class BitrateControllerTest : ShouldSpec() {
                 300.kbps,
                 BandwidthAllocation(
                     setOf(
-                        SingleAllocation("A", targetLayer = ld15),
-                        SingleAllocation("B", targetLayer = ld15),
-                        SingleAllocation("C", targetLayer = ld7_5),
-                        SingleAllocation("D", targetLayer = ld7_5)
+                        SingleAllocation(a, targetLayer = ld15),
+                        SingleAllocation(b, targetLayer = ld15),
+                        SingleAllocation(c, targetLayer = ld7_5),
+                        SingleAllocation(d, targetLayer = ld7_5)
                     )
                 )
             ),
@@ -971,10 +1365,10 @@ class BitrateControllerTest : ShouldSpec() {
                 350.kbps,
                 BandwidthAllocation(
                     setOf(
-                        SingleAllocation("A", targetLayer = ld15),
-                        SingleAllocation("B", targetLayer = ld15),
-                        SingleAllocation("C", targetLayer = ld15),
-                        SingleAllocation("D", targetLayer = ld7_5)
+                        SingleAllocation(a, targetLayer = ld15),
+                        SingleAllocation(b, targetLayer = ld15),
+                        SingleAllocation(c, targetLayer = ld15),
+                        SingleAllocation(d, targetLayer = ld7_5)
                     )
                 )
             ),
@@ -982,10 +1376,10 @@ class BitrateControllerTest : ShouldSpec() {
                 400.kbps,
                 BandwidthAllocation(
                     setOf(
-                        SingleAllocation("A", targetLayer = ld15),
-                        SingleAllocation("B", targetLayer = ld15),
-                        SingleAllocation("C", targetLayer = ld15),
-                        SingleAllocation("D", targetLayer = ld15)
+                        SingleAllocation(a, targetLayer = ld15),
+                        SingleAllocation(b, targetLayer = ld15),
+                        SingleAllocation(c, targetLayer = ld15),
+                        SingleAllocation(d, targetLayer = ld15)
                     )
                 )
             ),
@@ -993,10 +1387,10 @@ class BitrateControllerTest : ShouldSpec() {
                 450.kbps,
                 BandwidthAllocation(
                     setOf(
-                        SingleAllocation("A", targetLayer = ld30),
-                        SingleAllocation("B", targetLayer = ld15),
-                        SingleAllocation("C", targetLayer = ld15),
-                        SingleAllocation("D", targetLayer = ld15)
+                        SingleAllocation(a, targetLayer = ld30),
+                        SingleAllocation(b, targetLayer = ld15),
+                        SingleAllocation(c, targetLayer = ld15),
+                        SingleAllocation(d, targetLayer = ld15)
                     )
                 )
             ),
@@ -1004,10 +1398,10 @@ class BitrateControllerTest : ShouldSpec() {
                 500.kbps,
                 BandwidthAllocation(
                     setOf(
-                        SingleAllocation("A", targetLayer = ld30),
-                        SingleAllocation("B", targetLayer = ld30),
-                        SingleAllocation("C", targetLayer = ld15),
-                        SingleAllocation("D", targetLayer = ld15)
+                        SingleAllocation(a, targetLayer = ld30),
+                        SingleAllocation(b, targetLayer = ld30),
+                        SingleAllocation(c, targetLayer = ld15),
+                        SingleAllocation(d, targetLayer = ld15)
                     )
                 )
             ),
@@ -1015,10 +1409,10 @@ class BitrateControllerTest : ShouldSpec() {
                 550.kbps,
                 BandwidthAllocation(
                     setOf(
-                        SingleAllocation("A", targetLayer = ld30),
-                        SingleAllocation("B", targetLayer = ld30),
-                        SingleAllocation("C", targetLayer = ld30),
-                        SingleAllocation("D", targetLayer = ld15)
+                        SingleAllocation(a, targetLayer = ld30),
+                        SingleAllocation(b, targetLayer = ld30),
+                        SingleAllocation(c, targetLayer = ld30),
+                        SingleAllocation(d, targetLayer = ld15)
                     )
                 )
             ),
@@ -1026,10 +1420,10 @@ class BitrateControllerTest : ShouldSpec() {
                 610.kbps,
                 BandwidthAllocation(
                     setOf(
-                        SingleAllocation("A", targetLayer = ld30),
-                        SingleAllocation("B", targetLayer = ld30),
-                        SingleAllocation("C", targetLayer = ld30),
-                        SingleAllocation("D", targetLayer = ld30)
+                        SingleAllocation(a, targetLayer = ld30),
+                        SingleAllocation(b, targetLayer = ld30),
+                        SingleAllocation(c, targetLayer = ld30),
+                        SingleAllocation(d, targetLayer = ld30)
                     )
                 )
             ),
@@ -1037,10 +1431,10 @@ class BitrateControllerTest : ShouldSpec() {
                 960.kbps,
                 BandwidthAllocation(
                     setOf(
-                        SingleAllocation("A", targetLayer = sd30),
-                        SingleAllocation("B", targetLayer = ld30),
-                        SingleAllocation("C", targetLayer = ld30),
-                        SingleAllocation("D", targetLayer = ld30)
+                        SingleAllocation(a, targetLayer = sd30),
+                        SingleAllocation(b, targetLayer = ld30),
+                        SingleAllocation(c, targetLayer = ld30),
+                        SingleAllocation(d, targetLayer = ld30)
                     )
                 )
             ),
@@ -1048,10 +1442,10 @@ class BitrateControllerTest : ShouldSpec() {
                 1310.kbps,
                 BandwidthAllocation(
                     setOf(
-                        SingleAllocation("A", targetLayer = sd30),
-                        SingleAllocation("B", targetLayer = sd30),
-                        SingleAllocation("C", targetLayer = ld30),
-                        SingleAllocation("D", targetLayer = ld30)
+                        SingleAllocation(a, targetLayer = sd30),
+                        SingleAllocation(b, targetLayer = sd30),
+                        SingleAllocation(c, targetLayer = ld30),
+                        SingleAllocation(d, targetLayer = ld30)
                     )
                 )
             ),
@@ -1059,10 +1453,10 @@ class BitrateControllerTest : ShouldSpec() {
                 1660.kbps,
                 BandwidthAllocation(
                     setOf(
-                        SingleAllocation("A", targetLayer = sd30),
-                        SingleAllocation("B", targetLayer = sd30),
-                        SingleAllocation("C", targetLayer = sd30),
-                        SingleAllocation("D", targetLayer = ld30)
+                        SingleAllocation(a, targetLayer = sd30),
+                        SingleAllocation(b, targetLayer = sd30),
+                        SingleAllocation(c, targetLayer = sd30),
+                        SingleAllocation(d, targetLayer = ld30)
                     )
                 )
             ),
@@ -1070,10 +1464,10 @@ class BitrateControllerTest : ShouldSpec() {
                 2010.kbps,
                 BandwidthAllocation(
                     setOf(
-                        SingleAllocation("A", targetLayer = sd30),
-                        SingleAllocation("B", targetLayer = sd30),
-                        SingleAllocation("C", targetLayer = sd30),
-                        SingleAllocation("D", targetLayer = sd30)
+                        SingleAllocation(a, targetLayer = sd30),
+                        SingleAllocation(b, targetLayer = sd30),
+                        SingleAllocation(c, targetLayer = sd30),
+                        SingleAllocation(d, targetLayer = sd30)
                     )
                 )
             )
@@ -1083,16 +1477,16 @@ class BitrateControllerTest : ShouldSpec() {
     private fun verifyTileViewLastN1(maxFrameHeight: Int = 180) {
         // At this stage the purpose of this is just to document current behavior.
         // TODO: The results with bwe==-1 are wrong.
-        bc.forwardedEndpointsHistory.removeIf { it.bwe < 0.bps }
-        bc.forwardedEndpointsHistory.map { it.event }.shouldContainInOrder(
-            setOf("A")
+        bc.forwardedSourcesHistory.removeIf { it.bwe < 0.bps }
+        bc.forwardedSourcesHistory.map { it.event }.shouldContainInOrder(
+            setOf("A-v0")
         )
 
         bc.effectiveConstraintsHistory.last().event shouldBe mapOf(
-            "A" to VideoConstraints(maxFrameHeight),
-            "B" to VideoConstraints(0),
-            "C" to VideoConstraints(0),
-            "D" to VideoConstraints(0)
+            "A-v0" to VideoConstraints(maxFrameHeight),
+            "B-v0" to VideoConstraints(0),
+            "C-v0" to VideoConstraints(0),
+            "D-v0" to VideoConstraints(0)
         )
 
         val expectedAllocationHistory = mutableListOf(
@@ -1101,10 +1495,10 @@ class BitrateControllerTest : ShouldSpec() {
                 (-1).bps,
                 BandwidthAllocation(
                     setOf(
-                        SingleAllocation("A", targetLayer = noVideo),
-                        SingleAllocation("B", targetLayer = noVideo),
-                        SingleAllocation("C", targetLayer = noVideo),
-                        SingleAllocation("D", targetLayer = noVideo)
+                        SingleAllocation(a, targetLayer = noVideo),
+                        SingleAllocation(b, targetLayer = noVideo),
+                        SingleAllocation(c, targetLayer = noVideo),
+                        SingleAllocation(d, targetLayer = noVideo)
                     ),
                     oversending = true
                 )
@@ -1113,10 +1507,10 @@ class BitrateControllerTest : ShouldSpec() {
                 50.kbps,
                 BandwidthAllocation(
                     setOf(
-                        SingleAllocation("A", targetLayer = ld7_5),
-                        SingleAllocation("B", targetLayer = noVideo),
-                        SingleAllocation("C", targetLayer = noVideo),
-                        SingleAllocation("D", targetLayer = noVideo)
+                        SingleAllocation(a, targetLayer = ld7_5),
+                        SingleAllocation(b, targetLayer = noVideo),
+                        SingleAllocation(c, targetLayer = noVideo),
+                        SingleAllocation(d, targetLayer = noVideo)
                     )
                 )
             ),
@@ -1124,21 +1518,22 @@ class BitrateControllerTest : ShouldSpec() {
                 100.kbps,
                 BandwidthAllocation(
                     setOf(
-                        SingleAllocation("A", targetLayer = ld15),
-                        SingleAllocation("B", targetLayer = noVideo),
-                        SingleAllocation("C", targetLayer = noVideo),
-                        SingleAllocation("D", targetLayer = noVideo)
+                        SingleAllocation(a, targetLayer = ld15),
+                        SingleAllocation(b, targetLayer = noVideo),
+                        SingleAllocation(c, targetLayer = noVideo),
+                        SingleAllocation(d, targetLayer = noVideo)
                     )
                 )
             ),
             Event(
-                160.kbps, // TODO: why 160 instead of 150? weird.
+                // TODO: why 160 instead of 150? weird.
+                160.kbps,
                 BandwidthAllocation(
                     setOf(
-                        SingleAllocation("A", targetLayer = ld30),
-                        SingleAllocation("B", targetLayer = noVideo),
-                        SingleAllocation("C", targetLayer = noVideo),
-                        SingleAllocation("D", targetLayer = noVideo)
+                        SingleAllocation(a, targetLayer = ld30),
+                        SingleAllocation(b, targetLayer = noVideo),
+                        SingleAllocation(c, targetLayer = noVideo),
+                        SingleAllocation(d, targetLayer = noVideo)
                     )
                 )
             )
@@ -1150,10 +1545,10 @@ class BitrateControllerTest : ShouldSpec() {
                         510.kbps,
                         BandwidthAllocation(
                             setOf(
-                                SingleAllocation("A", targetLayer = sd30),
-                                SingleAllocation("B", targetLayer = noVideo),
-                                SingleAllocation("C", targetLayer = noVideo),
-                                SingleAllocation("D", targetLayer = noVideo)
+                                SingleAllocation(a, targetLayer = sd30),
+                                SingleAllocation(b, targetLayer = noVideo),
+                                SingleAllocation(c, targetLayer = noVideo),
+                                SingleAllocation(d, targetLayer = noVideo)
                             )
                         )
                     )
@@ -1164,59 +1559,45 @@ class BitrateControllerTest : ShouldSpec() {
     }
 }
 
-fun List<Event<BandwidthAllocation>>.shouldMatchInOrder(vararg events: Event<BandwidthAllocation>) {
-    size shouldBe events.size
-    events.forEachIndexed { i, it ->
-        this[i].bwe shouldBe it.bwe
-        withClue("bwe=${it.bwe}") {
-            this[i].event.shouldMatch(it.event)
-        }
-        // Ignore this.time
-    }
-}
-
-fun BandwidthAllocation.shouldMatch(other: BandwidthAllocation) {
-    allocations.size shouldBe other.allocations.size
-    allocations.forEach { thisSingleAllocation ->
-        withClue("Allocation for ${thisSingleAllocation.endpointId}") {
-            val otherSingleAllocation = other.allocations.find { it.endpointId == thisSingleAllocation.endpointId }
-            otherSingleAllocation.shouldNotBeNull()
-            thisSingleAllocation.targetLayer?.height shouldBe otherSingleAllocation.targetLayer?.height
-            thisSingleAllocation.targetLayer?.frameRate shouldBe otherSingleAllocation.targetLayer?.frameRate
-        }
-    }
-}
-
-private class BitrateControllerWrapper(vararg endpointIds: String, val clock: FakeClock = FakeClock()) {
-    var endpoints: List<Endpoint> = createEndpoints(*endpointIds)
+class BitrateControllerWrapper(
+    initialEndpoints: List<MediaSourceContainer>,
+    val clock: FakeClock = FakeClock(),
+    /**
+     * Runs the periodic re-allocation. By default a fake which is never run: the tests drive the allocation
+     * themselves, and this way the allocators they create (and do not always expire) do not keep rescheduling
+     * themselves on [TaskPools.SCHEDULED_POOL] for the rest of the test run.
+     */
+    scheduler: ScheduledExecutorService = FakeScheduledExecutorService()
+) {
+    var endpoints: List<MediaSourceContainer> = initialEndpoints
     val logger = createLogger()
 
     var bwe = (-1).bps
         set(value) {
             logger.debug("Setting bwe=$value")
             field = value
-            bc.bandwidthChanged(value.bps.toLong())
+            bc.bandwidthChanged(value.bps)
         }
 
     // Save the output.
     val effectiveConstraintsHistory: History<Map<String, VideoConstraints>> = mutableListOf()
-    val forwardedEndpointsHistory: History<Set<String>> = mutableListOf()
+    val forwardedSourcesHistory: History<Set<String>> = mutableListOf()
     val allocationHistory: History<BandwidthAllocation> = mutableListOf()
 
     val bc = BitrateController(
         object : BitrateController.EventHandler {
-            override fun forwardedEndpointsChanged(forwardedEndpoints: Set<String>) {
-                Event(bwe, forwardedEndpoints, clock.instant()).apply {
-                    logger.info("Forwarded endpoints changed: $this")
-                    forwardedEndpointsHistory.add(this)
+            override fun forwardedSourcesChanged(forwardedSources: Set<String>) {
+                Event(bwe, forwardedSources, clock.instant()).apply {
+                    logger.info("Forwarded sources changed: $this")
+                    forwardedSourcesHistory.add(this)
                 }
             }
 
             override fun effectiveVideoConstraintsChanged(
-                oldEffectiveConstraints: Map<String, VideoConstraints>,
-                newEffectiveConstraints: Map<String, VideoConstraints>
+                oldEffectiveConstraints: EffectiveConstraintsMap,
+                newEffectiveConstraints: EffectiveConstraintsMap
             ) {
-                Event(bwe, newEffectiveConstraints, clock.instant()).apply {
+                Event(bwe, newEffectiveConstraints.mapKeys { it.key.sourceName }, clock.instant()).apply {
                     logger.info("Effective constraints changed: $this")
                     effectiveConstraintsHistory.add(this)
                 }
@@ -1238,54 +1619,34 @@ private class BitrateControllerWrapper(vararg endpointIds: String, val clock: Fa
         Supplier { endpoints },
         DiagnosticContext(),
         logger,
-        clock
-    )
+        clock,
+        scheduler
+    ).apply { bandwidthChanged(bwe.bps) } // TODO: handle the -1 bps case better
 
-    fun setEndpointOrdering(vararg endpoints: Endpoint) {
+    fun setEndpointOrdering(vararg endpoints: TestEndpoint) {
         logger.info("Set endpoints ${endpoints.map{ it.id }.joinToString(",")}")
         this.endpoints = endpoints.toList()
         bc.endpointOrderingChanged()
     }
 
-    fun setStageView(onStageEndpoint: String, maxFrameHeight: Int = 720, legacy: Boolean = true, lastN: Int? = null) {
-        if (legacy) {
-            lastN?.let { bc.lastN = lastN }
-            bc.setMaxFrameHeight(maxFrameHeight)
-            bc.setSelectedEndpoints(listOf(onStageEndpoint))
-        } else {
-            bc.setBandwidthAllocationSettings(
-                ReceiverVideoConstraintsMessage(
-                    lastN = lastN,
-                    onStageEndpoints = listOf(onStageEndpoint),
-                    constraints = mapOf(onStageEndpoint to VideoConstraints(720))
-                )
+    fun setStageView(onStageSource: String, lastN: Int? = null) {
+        bc.setBandwidthAllocationSettings(
+            ReceiverVideoConstraintsMessage(
+                lastN = lastN,
+                onStageSources = listOf(onStageSource),
+                constraints = mapOf(onStageSource to VideoConstraints(720))
             )
-        }
+        )
     }
 
-    fun setSelectedEndpoints(vararg selectedEndpoints: String, maxFrameHeight: Int? = null) {
-        maxFrameHeight?.let { bc.setMaxFrameHeight(it) }
-        bc.setSelectedEndpoints(listOf(*selectedEndpoints))
-    }
-
-    fun setTileView(
-        vararg selectedEndpoints: String,
-        maxFrameHeight: Int = 180,
-        legacy: Boolean = true,
-        lastN: Int? = null
-    ) {
-        if (legacy) {
-            lastN?.let { bc.lastN = lastN }
-            setSelectedEndpoints(*selectedEndpoints, maxFrameHeight = maxFrameHeight)
-        } else {
-            bc.setBandwidthAllocationSettings(
-                ReceiverVideoConstraintsMessage(
-                    lastN = lastN,
-                    selectedEndpoints = listOf(*selectedEndpoints),
-                    constraints = selectedEndpoints.map { it to VideoConstraints(maxFrameHeight) }.toMap()
-                )
+    fun setTileView(vararg selectedSources: String, maxFrameHeight: Int = 180, lastN: Int? = null) {
+        bc.setBandwidthAllocationSettings(
+            ReceiverVideoConstraintsMessage(
+                lastN = lastN,
+                selectedSources = listOf(*selectedSources),
+                constraints = selectedSources.map { it to VideoConstraints(maxFrameHeight) }.toMap()
             )
-        }
+        )
     }
 
     init {
@@ -1296,6 +1657,102 @@ private class BitrateControllerWrapper(vararg endpointIds: String, val clock: Fa
         // Adaptivity is disabled when RTX support is not signalled.
         bc.addPayloadType(RtxPayloadType(123, mapOf("apt" to "124")))
     }
+}
+
+class TestEndpoint(
+    override val id: String,
+    override val mediaSources: Array<MediaSourceDesc> = emptyArray()
+) : MediaSourceContainer
+
+fun createEndpoints(vararg ids: String): MutableList<TestEndpoint> = MutableList(ids.size) { i ->
+    TestEndpoint(
+        ids[i],
+        arrayOf(
+            createSourceDesc(
+                3 * i + 1,
+                3 * i + 2,
+                3 * i + 3,
+                ids[i] + "-v0",
+                ids[i]
+            )
+        )
+    )
+}
+
+fun createSources(vararg ids: String): MutableList<MediaSourceDesc> = MutableList(ids.size) { i ->
+    createSourceDesc(
+        3 * i + 1,
+        3 * i + 2,
+        3 * i + 3,
+        ids[i],
+        ids[i]
+    )
+}
+
+fun createSourceDesc(ssrc1: Int, ssrc2: Int, ssrc3: Int, sourceName: String, owner: String): MediaSourceDesc =
+    MediaSourceDesc(
+        arrayOf(
+            RtpEncodingDesc(ssrc1.toLong(), arrayOf(ld7_5, ld15, ld30)),
+            RtpEncodingDesc(ssrc2.toLong(), arrayOf(sd7_5, sd15, sd30)),
+            RtpEncodingDesc(ssrc3.toLong(), arrayOf(hd7_5, hd15, hd30))
+        ),
+        sourceName = sourceName,
+        owner = owner
+    )
+
+val bitrateLd = 150.kbps
+val bitrateSd = 500.kbps
+val bitrateHd = 2000.kbps
+
+val ld7_5
+    get() = MockRtpLayerDesc(tid = 0, eid = 0, height = 180, frameRate = 7.5, bitrate = bitrateLd * 0.33)
+val ld15
+    get() = MockRtpLayerDesc(tid = 1, eid = 0, height = 180, frameRate = 15.0, bitrate = bitrateLd * 0.66)
+val ld30
+    get() = MockRtpLayerDesc(tid = 2, eid = 0, height = 180, frameRate = 30.0, bitrate = bitrateLd)
+
+val sd7_5
+    get() = MockRtpLayerDesc(tid = 0, eid = 1, height = 360, frameRate = 7.5, bitrate = bitrateSd * 0.33)
+val sd15
+    get() = MockRtpLayerDesc(tid = 1, eid = 1, height = 360, frameRate = 15.0, bitrate = bitrateSd * 0.66)
+val sd30
+    get() = MockRtpLayerDesc(tid = 2, eid = 1, height = 360, frameRate = 30.0, bitrate = bitrateSd)
+
+val hd7_5
+    get() = MockRtpLayerDesc(tid = 0, eid = 2, height = 720, frameRate = 7.5, bitrate = bitrateHd * 0.33)
+val hd15
+    get() = MockRtpLayerDesc(tid = 1, eid = 2, height = 720, frameRate = 15.0, bitrate = bitrateHd * 0.66)
+val hd30
+    get() = MockRtpLayerDesc(tid = 2, eid = 2, height = 720, frameRate = 30.0, bitrate = bitrateHd)
+
+val noVideo: RtpLayerDesc? = null
+
+/**
+ * An [RtpLayerDesc] whose bitrate can be set externally. We inherit directly from [RtpLayerDesc], because mocking with
+ * mockk absolutely kills the performance.
+ */
+class MockRtpLayerDesc(
+    tid: Int,
+    eid: Int,
+    height: Int,
+    frameRate: Double,
+    /**
+     * Note: this mock impl does not model the dependency layers, so the cumulative bitrate should be provided.
+     */
+    var bitrate: Bandwidth,
+    sid: Int = -1
+) : RtpLayerDesc(eid, tid, sid, height, frameRate) {
+    override fun copy(height: Int, tid: Int, inherit: Boolean): RtpLayerDesc {
+        TODO("Not yet implemented")
+    }
+
+    override val layerId = getIndex(0, sid, tid)
+    override val index = getIndex(eid, sid, tid)
+
+    override fun getBitrate(nowMs: Long): Bandwidth = bitrate
+    override fun getSmoothedBitrate(nowMs: Long): Bandwidth = bitrate
+    override fun hasZeroBitrate(nowMs: Long): Boolean = bitrate == 0.bps
+    override fun indexString() = indexString(index)
 }
 
 typealias History<T> = MutableList<Event<T>>
@@ -1309,78 +1766,5 @@ data class Event<T>(
         if (other !is Event<*>) return false
         // Ignore this.time
         return bwe == other.bwe && event == other.event
-    }
-}
-
-class Endpoint(
-    override val id: String,
-    mediaSource: MediaSourceDesc? = null
-) : MediaSourceContainer {
-    override val mediaSources = mediaSource?.let { arrayOf(mediaSource) } ?: emptyArray()
-}
-
-fun createEndpoints(vararg ids: String): MutableList<Endpoint> {
-    return MutableList(ids.size) { i ->
-        Endpoint(
-            ids[i],
-            createSource(
-                3 * i + 1,
-                3 * i + 2,
-                3 * i + 3
-            )
-        )
-    }
-}
-
-fun createSource(ssrc1: Int, ssrc2: Int, ssrc3: Int): MediaSourceDesc = MediaSourceDesc(
-    arrayOf(
-        RtpEncodingDesc(ssrc1.toLong(), arrayOf(ld7_5, ld15, ld30)),
-        RtpEncodingDesc(ssrc2.toLong(), arrayOf(sd7_5, sd15, sd30)),
-        RtpEncodingDesc(ssrc3.toLong(), arrayOf(hd7_5, hd15, hd30))
-    )
-)
-
-val bitrateLd = 150.kbps
-val bitrateSd = 500.kbps
-val bitrateHd = 2000.kbps
-
-val ld7_5
-    get() = createLayer(tid = 0, eid = 0, height = 180, frameRate = 7.5, bitrate = bitrateLd * 0.33)
-val ld15
-    get() = createLayer(tid = 1, eid = 0, height = 180, frameRate = 15.0, bitrate = bitrateLd * 0.66)
-val ld30
-    get() = createLayer(tid = 2, eid = 0, height = 180, frameRate = 30.0, bitrate = bitrateLd)
-
-val sd7_5
-    get() = createLayer(tid = 0, eid = 1, height = 360, frameRate = 7.5, bitrate = bitrateSd * 0.33)
-val sd15
-    get() = createLayer(tid = 1, eid = 1, height = 360, frameRate = 15.0, bitrate = bitrateSd * 0.66)
-val sd30
-    get() = createLayer(tid = 2, eid = 1, height = 360, frameRate = 30.0, bitrate = bitrateSd)
-
-val hd7_5
-    get() = createLayer(tid = 0, eid = 2, height = 720, frameRate = 7.5, bitrate = bitrateHd * 0.33)
-val hd15
-    get() = createLayer(tid = 1, eid = 2, height = 720, frameRate = 15.0, bitrate = bitrateHd * 0.66)
-val hd30
-    get() = createLayer(tid = 2, eid = 2, height = 720, frameRate = 30.0, bitrate = bitrateHd)
-
-val noVideo: RtpLayerDesc? = null
-
-fun createLayer(
-    tid: Int,
-    eid: Int,
-    height: Int,
-    frameRate: Double,
-    /**
-     * Note: this mock impl does not model the dependency layers, so the cumulative bitrate should be provided.
-     */
-    bitrate: Bandwidth
-): RtpLayerDesc {
-    val sid = -1
-
-    // Use a real RtpLayerDesc, because mocking absolutely kills the performance.
-    return object : RtpLayerDesc(eid, tid, sid, height, frameRate) {
-        override fun getBitrate(nowMs: Long): Bandwidth = bitrate
     }
 }

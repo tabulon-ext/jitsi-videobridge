@@ -16,20 +16,24 @@
 package org.jitsi.videobridge.util
 
 import org.jitsi.nlj.format.AudioRedPayloadType
+import org.jitsi.nlj.format.Av1PayloadType
 import org.jitsi.nlj.format.H264PayloadType
 import org.jitsi.nlj.format.OpusPayloadType
 import org.jitsi.nlj.format.OtherAudioPayloadType
 import org.jitsi.nlj.format.OtherVideoPayloadType
 import org.jitsi.nlj.format.PayloadType
+import org.jitsi.nlj.format.PayloadTypeEncoding.AV1
 import org.jitsi.nlj.format.PayloadTypeEncoding.Companion.createFrom
-import org.jitsi.nlj.format.PayloadTypeEncoding.VP8
-import org.jitsi.nlj.format.PayloadTypeEncoding.VP9
 import org.jitsi.nlj.format.PayloadTypeEncoding.H264
 import org.jitsi.nlj.format.PayloadTypeEncoding.OPUS
-import org.jitsi.nlj.format.PayloadTypeEncoding.RTX
-import org.jitsi.nlj.format.PayloadTypeEncoding.RED
 import org.jitsi.nlj.format.PayloadTypeEncoding.OTHER
+import org.jitsi.nlj.format.PayloadTypeEncoding.RED
+import org.jitsi.nlj.format.PayloadTypeEncoding.RTX
+import org.jitsi.nlj.format.PayloadTypeEncoding.TELEPHONE_EVENT
+import org.jitsi.nlj.format.PayloadTypeEncoding.VP8
+import org.jitsi.nlj.format.PayloadTypeEncoding.VP9
 import org.jitsi.nlj.format.RtxPayloadType
+import org.jitsi.nlj.format.TelephoneEventPayloadType
 import org.jitsi.nlj.format.VideoRedPayloadType
 import org.jitsi.nlj.format.Vp8PayloadType
 import org.jitsi.nlj.format.Vp9PayloadType
@@ -60,10 +64,7 @@ class PayloadTypeUtil {
          * @param ext the XML extension which describes the payload type.
          */
         @JvmStatic
-        fun create(
-            ext: PayloadTypePacketExtension,
-            mediaType: MediaType
-        ): PayloadType? {
+        fun create(ext: PayloadTypePacketExtension, mediaType: MediaType): PayloadType? {
             val parameters: MutableMap<String, String> = ConcurrentHashMap()
             ext.parameters.forEach { parameter ->
                 // In SDP, format parameters don't necessarily come in name=value pairs (see e.g. the format used in
@@ -90,21 +91,32 @@ class PayloadTypeUtil {
             val id = ext.id.toByte()
             val encoding = createFrom(ext.name)
             val clockRate = ext.clockrate
+            val channels = ext.channels
 
             return when (encoding) {
                 VP8 -> Vp8PayloadType(id, parameters, rtcpFeedbackSet)
+
                 VP9 -> Vp9PayloadType(id, parameters, rtcpFeedbackSet)
+
+                AV1 -> Av1PayloadType(id, parameters, rtcpFeedbackSet)
+
                 H264 -> H264PayloadType(id, parameters, rtcpFeedbackSet)
+
                 RTX -> RtxPayloadType(id, parameters)
-                OPUS -> OpusPayloadType(id, parameters)
+
+                OPUS -> OpusPayloadType(id, clockRate, channels, parameters)
+
+                TELEPHONE_EVENT -> TelephoneEventPayloadType(id, clockRate, channels, parameters)
+
                 RED -> when (mediaType) {
-                    AUDIO -> AudioRedPayloadType(id, clockRate, parameters)
+                    AUDIO -> AudioRedPayloadType(id, clockRate, channels, parameters)
                     VIDEO -> VideoRedPayloadType(id, clockRate, parameters, rtcpFeedbackSet)
                     else -> null
                 }
+
                 OTHER -> when (mediaType) {
-                    AUDIO -> OtherAudioPayloadType(id, clockRate, parameters)
-                    VIDEO -> OtherVideoPayloadType(id, clockRate, parameters)
+                    AUDIO -> OtherAudioPayloadType(id, ext.name, clockRate, channels, parameters)
+                    VIDEO -> OtherVideoPayloadType(id, ext.name, clockRate, parameters)
                     else -> null
                 }
             }

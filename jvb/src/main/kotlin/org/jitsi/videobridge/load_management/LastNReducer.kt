@@ -16,10 +16,10 @@
 
 package org.jitsi.videobridge.load_management
 
+import com.fasterxml.jackson.databind.node.JsonNodeFactory
 import org.jitsi.config.JitsiConfig
 import org.jitsi.metaconfig.config
 import org.jitsi.metaconfig.from
-import org.jitsi.nlj.util.OrderedJsonObject
 import org.jitsi.utils.logging2.cdebug
 import org.jitsi.utils.logging2.cinfo
 import org.jitsi.utils.logging2.createLogger
@@ -65,16 +65,14 @@ class LastNReducer(
         logger.cinfo { this.toString() }
     }
 
-    private fun getMaxForwardedEps(): Int? {
-        return conferencesSupplier.get()
-            .flatMap { it.endpoints }
-            .asSequence()
-            .filterIsInstance<Endpoint>()
-            .map {
-                it.numForwardedEndpoints()
-            }
-            .max()
-    }
+    private fun getMaxForwardedEps(): Int? = conferencesSupplier.get()
+        .flatMap { it.endpoints }
+        .asSequence()
+        .filterIsInstance<Endpoint>()
+        .map {
+            it.numForwardedSources()
+        }
+        .maxOrNull()
 
     override fun reduceLoad() {
         // Find the highest amount of endpoints any endpoint on this bridge is forwarding video for
@@ -117,7 +115,7 @@ class LastNReducer(
 
     override fun impactTime(): Duration = impactTime
 
-    override fun getStats() = OrderedJsonObject().apply {
+    override fun getStats() = JsonNodeFactory.instance.objectNode().apply {
         put("jvbLastN", jvbLastN.jvbLastN)
     }
 

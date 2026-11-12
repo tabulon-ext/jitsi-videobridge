@@ -1,0 +1,78 @@
+/*
+ * Copyright @ 2018 - Present, 8x8 Inc
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.jitsi.nlj
+
+import com.fasterxml.jackson.databind.node.ObjectNode
+import org.jitsi.nlj.rtcp.KeyframeCost
+import org.jitsi.nlj.rtcp.KeyframeModeDetector
+import org.jitsi.nlj.rtcp.KeyframeRequesterStats
+import org.jitsi.nlj.rtp.LossListener
+import org.jitsi.nlj.rtp.RtpExtensionType
+import org.jitsi.nlj.rtp.TransportCcEngine
+import org.jitsi.nlj.srtp.SrtpTransformers
+import org.jitsi.nlj.stats.EndpointConnectionStats
+import org.jitsi.nlj.stats.PacketStreamStats
+import org.jitsi.nlj.transform.node.outgoing.OutgoingStatisticsSnapshot
+
+/**
+ * Not an 'RtpSender' in the sense that it sends only RTP (and not
+ * RTCP) but in the sense of a webrtc 'RTCRTPSender' which handles
+ * all RTP and RTP control packets.
+ */
+abstract class RtpSender :
+    StatsKeepingPacketHandler(),
+    EventHandler,
+    Stoppable,
+    EndpointConnectionStats.EndpointConnectionStatsListener {
+
+    abstract fun sendProbing(mediaSsrcs: Collection<Long>, numBytes: Int): Int
+    abstract fun onOutgoingPacket(handler: PacketHandler)
+    abstract fun setSrtpTransformers(srtpTransformers: SrtpTransformers)
+    abstract fun getStreamStats(): OutgoingStatisticsSnapshot
+    abstract fun getPacketStreamStats(): PacketStreamStats.Snapshot
+    abstract fun addBandwidthListener(listener: TransportCcEngine.BandwidthListener)
+    abstract fun removeBandwidthListener(listener: TransportCcEngine.BandwidthListener)
+    abstract fun getTransportCcEngineStats(): TransportCcEngine.StatisticsSnapshot
+    abstract fun requestKeyframe(requesterID: String?, mediaSsrc: Long? = null)
+
+    /** Requests a keyframe meant for every receiver of the source with [sourceSsrc], or the first video source. */
+    abstract fun requestKeyframeForSource(requesterID: String?, sourceSsrc: Long?)
+
+    /** Set the source of measured keyframe costs used to bound the rate of keyframe requests. */
+    abstract fun setKeyframeCostSupplier(supplier: (Long) -> KeyframeCost?)
+
+    /**
+     * Sets the [KeyframeModeDetector], which learns how each source's sender answers keyframe requests. This
+     * sender tells it about the requests it sends.
+     */
+    abstract fun setKeyframeModeDetector(detector: KeyframeModeDetector)
+
+    /** The keyframe requester's cumulative keyframe budget counters, for aggregation into bridge-wide metrics. */
+    abstract fun getKeyframeBudgetStats(): KeyframeRequesterStats
+
+    abstract fun addLossListener(lossListener: LossListener)
+    abstract fun setFeature(feature: Features, enabled: Boolean)
+    abstract fun isFeatureEnabled(feature: Features): Boolean
+    abstract fun tearDown()
+    abstract fun addRtpExtensionToRetain(extensionType: RtpExtensionType)
+
+    /**
+     * An optional function to be executed for each RTP packet, as the first step of the send pipeline.
+     */
+    var preProcesor: ((PacketInfo) -> PacketInfo?)? = null
+
+    abstract fun debugState(mode: DebugStateMode): ObjectNode
+}

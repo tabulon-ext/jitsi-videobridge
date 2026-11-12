@@ -32,7 +32,11 @@ class SpeechActivityTest : ShouldSpec() {
     private val d = mockEndpoint("d")
     private val conferenceSpeechActivity = ConferenceSpeechActivity(object : ConferenceSpeechActivity.Listener {
         override fun lastNEndpointsChanged() {}
-        override fun dominantSpeakerChanged() {}
+        override fun recentSpeakersChanged(
+            recentSpeakers: List<AbstractEndpoint>,
+            dominantSpeakerChanged: Boolean,
+            silence: Boolean
+        ) {}
     })
 
     init {
@@ -77,17 +81,17 @@ class SpeechActivityTest : ShouldSpec() {
 
             conferenceSpeechActivity.orderedEndpoints shouldContainExactly listOf(a, b, c, d)
 
-            every { a.isSendingVideo } returns false
+            every { a.hasVideoAvailable() } returns false
             conferenceSpeechActivity.updateLastNEndpoints()
             conferenceSpeechActivity.dominantEndpoint shouldBe a
             conferenceSpeechActivity.orderedEndpoints shouldContainExactly listOf(b, c, d, a)
 
-            every { a.isSendingVideo } returns true
+            every { a.hasVideoAvailable() } returns true
             conferenceSpeechActivity.updateLastNEndpoints()
             conferenceSpeechActivity.dominantEndpoint shouldBe a
             conferenceSpeechActivity.orderedEndpoints shouldContainExactly listOf(a, b, c, d)
 
-            every { b.isSendingVideo } returns false
+            every { b.hasVideoAvailable() } returns false
             conferenceSpeechActivity.updateLastNEndpoints()
             conferenceSpeechActivity.dominantEndpoint shouldBe a
             conferenceSpeechActivity.orderedEndpoints shouldContainExactly listOf(a, c, d, b)
@@ -96,15 +100,15 @@ class SpeechActivityTest : ShouldSpec() {
             conferenceSpeechActivity.dominantEndpoint shouldBe b
             conferenceSpeechActivity.orderedEndpoints shouldContainExactly listOf(a, c, d, b)
 
-            every { b.isSendingVideo } returns true
+            every { b.hasVideoAvailable() } returns true
             conferenceSpeechActivity.updateLastNEndpoints()
             conferenceSpeechActivity.dominantEndpoint shouldBe b
             conferenceSpeechActivity.orderedEndpoints shouldContainExactly listOf(b, a, c, d)
 
-            every { a.isSendingVideo } returns false
-            every { b.isSendingVideo } returns false
-            every { c.isSendingVideo } returns false
-            every { d.isSendingVideo } returns false
+            every { a.hasVideoAvailable() } returns false
+            every { b.hasVideoAvailable() } returns false
+            every { c.hasVideoAvailable() } returns false
+            every { d.hasVideoAvailable() } returns false
             conferenceSpeechActivity.updateLastNEndpoints()
             conferenceSpeechActivity.activeSpeakerChanged(a.id)
             conferenceSpeechActivity.dominantEndpoint shouldBe a
@@ -115,7 +119,7 @@ class SpeechActivityTest : ShouldSpec() {
     companion object {
         fun mockEndpoint(endpointId: String) = mockk<AbstractEndpoint>().apply {
             every { id } returns endpointId
-            every { isSendingVideo } returns true
+            every { hasVideoAvailable() } returns true
         }
     }
 }

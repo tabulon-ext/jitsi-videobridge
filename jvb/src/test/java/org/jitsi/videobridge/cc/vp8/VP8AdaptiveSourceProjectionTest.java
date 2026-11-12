@@ -1,8 +1,22 @@
+/*
+ * Copyright @ 2019 - Present, 8x8 Inc
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
 package org.jitsi.videobridge.cc.vp8;
 
 import org.jitsi.nlj.*;
 import org.jitsi.nlj.codec.vpx.*;
-import org.jitsi.nlj.format.*;
 import org.jitsi.nlj.rtp.codec.vp8.*;
 import org.jitsi.nlj.util.*;
 import org.jitsi.rtp.rtcp.*;
@@ -15,16 +29,15 @@ import org.jitsi_modified.impl.neomedia.codec.video.vp8.*;
 import org.junit.*;
 
 import javax.xml.bind.*;
+import java.time.*;
 import java.util.*;
-import java.util.concurrent.*;
 
+import static org.jitsi.videobridge.cc.EncodingSwitchPolicy.ALL_LIVE;
 import static org.junit.Assert.*;
 
 public class VP8AdaptiveSourceProjectionTest
 {
     private final Logger logger = new LoggerImpl(getClass().getName());
-    private final PayloadType payloadType = new Vp8PayloadType((byte)96,
-        new ConcurrentHashMap<>(), new CopyOnWriteArraySet<>());
 
     @Test
     public void singlePacketProjectionTest() throws RewriteException
@@ -36,8 +49,7 @@ public class VP8AdaptiveSourceProjectionTest
             new RtpState(1, 10000, 1000000);
 
         VP8AdaptiveSourceProjectionContext context =
-            new VP8AdaptiveSourceProjectionContext(diagnosticContext, payloadType,
-                initialState, logger);
+            new VP8AdaptiveSourceProjectionContext(diagnosticContext, initialState, logger);
 
         Vp8PacketGenerator generator = new Vp8PacketGenerator(1);
 
@@ -46,7 +58,7 @@ public class VP8AdaptiveSourceProjectionTest
 
         int targetIndex = RtpLayerDesc.getIndex(0, 0, 0);
 
-        assertTrue(context.accept(packetInfo, packet.getTemporalLayerIndex(), targetIndex));
+        assertTrue(context.accept(packetInfo, targetIndex, ALL_LIVE));
 
         context.rewriteRtp(packetInfo);
 
@@ -68,7 +80,7 @@ public class VP8AdaptiveSourceProjectionTest
         int targetIndex = RtpLayerDesc.getIndex(0, 0, targetTid);
 
         VP8AdaptiveSourceProjectionContext context =
-            new VP8AdaptiveSourceProjectionContext(diagnosticContext, payloadType,
+            new VP8AdaptiveSourceProjectionContext(diagnosticContext,
                 initialState, logger);
 
         int expectedSeq = 10001;
@@ -81,7 +93,7 @@ public class VP8AdaptiveSourceProjectionTest
             PacketInfo packetInfo = generator.nextPacket();
             Vp8Packet packet = packetInfo.packetAs();
 
-            boolean accepted = context.accept(packetInfo, packet.getTemporalLayerIndex(), targetIndex);
+            boolean accepted = context.accept(packetInfo, targetIndex, ALL_LIVE);
 
             if (packet.isStartOfFrame() && packet.getTemporalLayerIndex() == 0)
             {
@@ -120,10 +132,10 @@ public class VP8AdaptiveSourceProjectionTest
     {
         final Vp8Packet packet;
         final int origSeq;
-        final int extOrigSeq;
+        final long extOrigSeq;
         final boolean nearOldest;
 
-        ProjectedPacket(Vp8Packet p, int s, int e, boolean o)
+        ProjectedPacket(Vp8Packet p, int s, long e, boolean o)
         {
             packet = p;
             origSeq = s;
@@ -160,14 +172,13 @@ public class VP8AdaptiveSourceProjectionTest
 
         VP8AdaptiveSourceProjectionContext context =
             new VP8AdaptiveSourceProjectionContext(diagnosticContext,
-                payloadType,
                 initialState, logger);
 
         int latestSeq = buffer.get(0).<Vp8Packet>packetAs().getSequenceNumber();
 
-        TreeMap<Integer, ProjectedPacket> projectedPackets = new TreeMap<>();
-        Rfc3711IndexTracker origSeqIdxTracker = new Rfc3711IndexTracker();
-        Rfc3711IndexTracker newSeqIdxTracker = new Rfc3711IndexTracker();
+        TreeMap<Long, ProjectedPacket> projectedPackets = new TreeMap<>();
+        RtpSequenceIndexTracker origSeqIdxTracker = new RtpSequenceIndexTracker();
+        RtpSequenceIndexTracker newSeqIdxTracker = new RtpSequenceIndexTracker();
 
         for (int i = 0; i < 100000; i++)
         {
@@ -182,7 +193,7 @@ public class VP8AdaptiveSourceProjectionTest
             {
                 latestSeq = origSeq;
             }
-            boolean accepted = context.accept(packetInfo, packet.getTemporalLayerIndex(), targetIndex);
+            boolean accepted = context.accept(packetInfo, targetIndex, ALL_LIVE);
 
             int oldestValidSeq = RtpUtils.applySequenceNumberDelta(latestSeq, -((VP8FrameMap.FRAME_MAP_SIZE - 1) * generator.packetsPerFrame));
 
@@ -215,8 +226,8 @@ public class VP8AdaptiveSourceProjectionTest
                 assertEquals(RtpUtils.applyTimestampDelta(origTs, expectedTsOffset), packet.getTimestamp());
                 assertEquals(origTl0PicIdx, packet.getTL0PICIDX());
                 int newSeq = packet.getSequenceNumber();
-                int extNewSeq = newSeqIdxTracker.update(newSeq);
-                int extOrigSeq = origSeqIdxTracker.update(origSeq);
+                long extNewSeq = newSeqIdxTracker.update(newSeq);
+                long extOrigSeq = origSeqIdxTracker.update(origSeq);
                 assertFalse(projectedPackets.containsKey(extNewSeq));
                 projectedPackets.put(extNewSeq, new ProjectedPacket(packet, origSeq, extOrigSeq, nearOldest));
             }
@@ -229,7 +240,7 @@ public class VP8AdaptiveSourceProjectionTest
             Collections.shuffle(buffer, random);
         }
 
-        Iterator<Integer> iter = projectedPackets.keySet().iterator();
+        Iterator<Long> iter = projectedPackets.keySet().iterator();
 
         ProjectedPacket prevPacket = projectedPackets.get(iter.next());
 
@@ -255,8 +266,8 @@ public class VP8AdaptiveSourceProjectionTest
         ProjectedPacket firstPacket = projectedPackets.firstEntry().getValue();
         ProjectedPacket lastPacket = projectedPackets.lastEntry().getValue();
 
-        int origDelta = lastPacket.extOrigSeq - firstPacket.extOrigSeq;
-        int projDelta = projectedPackets.lastKey() - projectedPackets.firstKey();
+        long origDelta = lastPacket.extOrigSeq - firstPacket.extOrigSeq;
+        long projDelta = projectedPackets.lastKey() - projectedPackets.firstKey();
         assertTrue(projDelta <= origDelta);
     }
 
@@ -369,8 +380,7 @@ public class VP8AdaptiveSourceProjectionTest
             new RtpState(1, 10000, 1000000);
 
         VP8AdaptiveSourceProjectionContext context =
-            new VP8AdaptiveSourceProjectionContext(diagnosticContext, payloadType,
-                initialState, logger);
+            new VP8AdaptiveSourceProjectionContext(diagnosticContext, initialState, logger);
 
         PacketInfo firstPacketInfo = generator.nextPacket();
         Vp8Packet firstPacket = firstPacketInfo.packetAs();
@@ -382,10 +392,10 @@ public class VP8AdaptiveSourceProjectionTest
             PacketInfo packetInfo = generator.nextPacket();
             Vp8Packet packet = packetInfo.packetAs();
 
-            assertFalse(context.accept(packetInfo, RtpLayerDesc.getIndex(0, 0, packet.getTemporalLayerIndex()), targetIndex));
+            assertFalse(context.accept(packetInfo, targetIndex, ALL_LIVE));
         }
 
-        assertTrue(context.accept(firstPacketInfo, RtpLayerDesc.getIndex(0, 0, firstPacket.getTemporalLayerIndex()), targetIndex));
+        assertTrue(context.accept(firstPacketInfo, targetIndex, ALL_LIVE));
         context.rewriteRtp(firstPacketInfo);
 
         for (int i = 0; i < 9996; i++)
@@ -393,7 +403,7 @@ public class VP8AdaptiveSourceProjectionTest
             PacketInfo packetInfo = generator.nextPacket();
             Vp8Packet packet = packetInfo.packetAs();
 
-            assertTrue(context.accept(packetInfo, RtpLayerDesc.getIndex(0, 0, packet.getTemporalLayerIndex()), targetIndex));
+            assertTrue(context.accept(packetInfo, targetIndex, ALL_LIVE));
             context.rewriteRtp(packetInfo);
         }
     }
@@ -410,8 +420,7 @@ public class VP8AdaptiveSourceProjectionTest
             new RtpState(1, 10000, 1000000);
 
         VP8AdaptiveSourceProjectionContext context =
-            new VP8AdaptiveSourceProjectionContext(diagnosticContext, payloadType,
-                initialState, logger);
+            new VP8AdaptiveSourceProjectionContext(diagnosticContext, initialState, logger);
 
         PacketInfo firstPacketInfo = generator.nextPacket();
         Vp8Packet firstPacket = firstPacketInfo.packetAs();
@@ -423,17 +432,17 @@ public class VP8AdaptiveSourceProjectionTest
             PacketInfo packetInfo = generator.nextPacket();
             Vp8Packet packet = packetInfo.packetAs();
 
-            assertFalse(context.accept(packetInfo, RtpLayerDesc.getIndex(0, 0, packet.getTemporalLayerIndex()), targetIndex));
+            assertFalse(context.accept(packetInfo, targetIndex, ALL_LIVE));
         }
 
-        assertFalse(context.accept(firstPacketInfo, RtpLayerDesc.getIndex(0, 0, firstPacket.getTemporalLayerIndex()), targetIndex));
+        assertFalse(context.accept(firstPacketInfo, targetIndex, ALL_LIVE));
 
         for (int i = 0; i < 10; i++)
         {
             PacketInfo packetInfo = generator.nextPacket();
             Vp8Packet packet = packetInfo.packetAs();
 
-            assertFalse(context.accept(packetInfo, RtpLayerDesc.getIndex(0, 0, packet.getTemporalLayerIndex()), targetIndex));
+            assertFalse(context.accept(packetInfo, targetIndex, ALL_LIVE));
         }
 
         generator.requestKeyframe();
@@ -443,7 +452,7 @@ public class VP8AdaptiveSourceProjectionTest
             PacketInfo packetInfo = generator.nextPacket();
             Vp8Packet packet = packetInfo.packetAs();
 
-            assertTrue(context.accept(packetInfo, RtpLayerDesc.getIndex(0, 0, packet.getTemporalLayerIndex()), targetIndex));
+            assertTrue(context.accept(packetInfo, targetIndex, ALL_LIVE));
             context.rewriteRtp(packetInfo);
         }
     }
@@ -460,8 +469,7 @@ public class VP8AdaptiveSourceProjectionTest
             new RtpState(1, 10000, 1000000);
 
         VP8AdaptiveSourceProjectionContext context =
-            new VP8AdaptiveSourceProjectionContext(diagnosticContext, payloadType,
-                initialState, logger);
+            new VP8AdaptiveSourceProjectionContext(diagnosticContext, initialState, logger);
 
         PacketInfo firstPacketInfo = generator.nextPacket();
         Vp8Packet firstPacket = firstPacketInfo.packetAs();
@@ -473,17 +481,17 @@ public class VP8AdaptiveSourceProjectionTest
             PacketInfo packetInfo = generator.nextPacket();
             Vp8Packet packet = packetInfo.packetAs();
 
-            assertFalse(context.accept(packetInfo, RtpLayerDesc.getIndex(0, 0, packet.getTemporalLayerIndex()), targetIndex));
+            assertFalse(context.accept(packetInfo, targetIndex, ALL_LIVE));
         }
 
-        assertFalse(context.accept(firstPacketInfo, firstPacket.getTemporalLayerIndex(), 2));
+        assertFalse(context.accept(firstPacketInfo, 2, ALL_LIVE));
 
         for (int i = 0; i < 30; i++)
         {
             PacketInfo packetInfo = generator.nextPacket();
             Vp8Packet packet = packetInfo.packetAs();
 
-            assertFalse(context.accept(packetInfo, RtpLayerDesc.getIndex(0, 0, packet.getTemporalLayerIndex()), targetIndex));
+            assertFalse(context.accept(packetInfo, targetIndex, ALL_LIVE));
         }
 
         generator.requestKeyframe();
@@ -493,7 +501,7 @@ public class VP8AdaptiveSourceProjectionTest
             PacketInfo packetInfo = generator.nextPacket();
             Vp8Packet packet = packetInfo.packetAs();
 
-            assertTrue(context.accept(packetInfo, RtpLayerDesc.getIndex(0, 0, packet.getTemporalLayerIndex()), targetIndex));
+            assertTrue(context.accept(packetInfo, targetIndex, ALL_LIVE));
             context.rewriteRtp(packetInfo);
         }
     }
@@ -501,8 +509,8 @@ public class VP8AdaptiveSourceProjectionTest
     @Test
     public void twoStreamsNoSwitchingTest() throws RewriteException
     {
-        Vp8PacketGenerator generator1 = new Vp8PacketGenerator(3);
-        Vp8PacketGenerator generator2 = new Vp8PacketGenerator(3);
+        Vp8PacketGenerator generator1 = new Vp8PacketGenerator(3, 1);
+        Vp8PacketGenerator generator2 = new Vp8PacketGenerator(3, 0);
         generator2.setSsrc(0xdeadbeefL);
 
         DiagnosticContext diagnosticContext = new DiagnosticContext();
@@ -512,8 +520,7 @@ public class VP8AdaptiveSourceProjectionTest
             new RtpState(1, 10000, 1000000);
 
         VP8AdaptiveSourceProjectionContext context =
-            new VP8AdaptiveSourceProjectionContext(diagnosticContext, payloadType,
-                initialState, logger);
+            new VP8AdaptiveSourceProjectionContext(diagnosticContext, initialState, logger);
 
         int targetIndex = RtpLayerDesc.getIndex(1, 0, 2);
 
@@ -524,12 +531,12 @@ public class VP8AdaptiveSourceProjectionTest
             PacketInfo packetInfo1 = generator1.nextPacket();
             Vp8Packet packet1 = packetInfo1.packetAs();
 
-            assertTrue(context.accept(packetInfo1, RtpLayerDesc.getIndex(1, 0, packet1.getTemporalLayerIndex()), targetIndex));
+            assertTrue(context.accept(packetInfo1, targetIndex, ALL_LIVE));
 
             PacketInfo packetInfo2 = generator2.nextPacket();
             Vp8Packet packet2 = packetInfo2.packetAs();
 
-            assertFalse(context.accept(packetInfo2, RtpLayerDesc.getIndex(0, 0, packet2.getTemporalLayerIndex()), targetIndex));
+            assertFalse(context.accept(packetInfo2, targetIndex, ALL_LIVE));
 
             context.rewriteRtp(packetInfo1);
 
@@ -547,8 +554,8 @@ public class VP8AdaptiveSourceProjectionTest
     @Test
     public void twoStreamsSwitchingTest() throws RewriteException
     {
-        Vp8PacketGenerator generator1 = new Vp8PacketGenerator(3);
-        Vp8PacketGenerator generator2 = new Vp8PacketGenerator(3);
+        Vp8PacketGenerator generator1 = new Vp8PacketGenerator(3, 0);
+        Vp8PacketGenerator generator2 = new Vp8PacketGenerator(3, 1);
         generator2.setSsrc(0xdeadbeefL);
 
         DiagnosticContext diagnosticContext = new DiagnosticContext();
@@ -558,8 +565,7 @@ public class VP8AdaptiveSourceProjectionTest
             new RtpState(1, 10000, 1000000);
 
         VP8AdaptiveSourceProjectionContext context =
-            new VP8AdaptiveSourceProjectionContext(diagnosticContext, payloadType,
-                initialState, logger);
+            new VP8AdaptiveSourceProjectionContext(diagnosticContext, initialState, logger);
 
         int expectedSeq = 10001;
         long expectedTs = 1003000;
@@ -580,7 +586,7 @@ public class VP8AdaptiveSourceProjectionTest
                 expectedTl0PicIdx = VpxUtils.applyTl0PicIdxDelta(expectedTl0PicIdx, 1);
             }
 
-            assertTrue(context.accept(packetInfo1, RtpLayerDesc.getIndex(0, 0, packet1.getTemporalLayerIndex()), targetIndex));
+            assertTrue(context.accept(packetInfo1, targetIndex, ALL_LIVE));
 
             context.rewriteRtp(packetInfo1);
 
@@ -592,7 +598,7 @@ public class VP8AdaptiveSourceProjectionTest
             PacketInfo packetInfo2 = generator2.nextPacket();
             Vp8Packet packet2 = packetInfo2.packetAs();
 
-            assertFalse(context.accept(packetInfo2, RtpLayerDesc.getIndex(1, 0, packet2.getTemporalLayerIndex()), targetIndex));
+            assertFalse(context.accept(packetInfo2, targetIndex, ALL_LIVE));
             assertFalse(context.rewriteRtcp(srPacket2));
 
             assertEquals(expectedSeq, packet1.getSequenceNumber());
@@ -621,7 +627,7 @@ public class VP8AdaptiveSourceProjectionTest
                 expectedTl0PicIdx = VpxUtils.applyTl0PicIdxDelta(expectedTl0PicIdx, 1);
             }
 
-            assertTrue(context.accept(packetInfo1, RtpLayerDesc.getIndex(0, 0, packet1.getTemporalLayerIndex()), targetIndex));
+            assertTrue(context.accept(packetInfo1, targetIndex, ALL_LIVE));
 
             context.rewriteRtp(packetInfo1);
 
@@ -633,7 +639,7 @@ public class VP8AdaptiveSourceProjectionTest
             PacketInfo packetInfo2 = generator2.nextPacket();
             Vp8Packet packet2 = packetInfo2.packetAs();
 
-            assertFalse(context.accept(packetInfo2, RtpLayerDesc.getIndex(1, 0, packet2.getTemporalLayerIndex()), targetIndex));
+            assertFalse(context.accept(packetInfo2, targetIndex, ALL_LIVE));
             assertFalse(context.rewriteRtcp(srPacket2));
 
             assertEquals(expectedSeq, packet1.getSequenceNumber());
@@ -666,7 +672,7 @@ public class VP8AdaptiveSourceProjectionTest
             }
 
             /* We will cut off the layer 0 keyframe after 1 packet, once we see the layer 1 keyframe. */
-            assertEquals(i == 0, context.accept(packetInfo1, RtpLayerDesc.getIndex(0, 0, packet1.getTemporalLayerIndex()), targetIndex));
+            assertEquals(i == 0, context.accept(packetInfo1, targetIndex, ALL_LIVE));
             assertEquals(i == 0, context.rewriteRtcp(srPacket1));
 
             if (i == 0)
@@ -685,7 +691,7 @@ public class VP8AdaptiveSourceProjectionTest
                 expectedTl0PicIdx = VpxUtils.applyTl0PicIdxDelta(expectedTl0PicIdx, 1);
             }
 
-            assertTrue(context.accept(packetInfo2, RtpLayerDesc.getIndex(1, 0, packet2.getTemporalLayerIndex()), targetIndex));
+            assertTrue(context.accept(packetInfo2, targetIndex, ALL_LIVE));
 
             context.rewriteRtp(packetInfo2);
 
@@ -729,8 +735,7 @@ public class VP8AdaptiveSourceProjectionTest
             new RtpState(1, 10000, 1000000);
 
         VP8AdaptiveSourceProjectionContext context =
-            new VP8AdaptiveSourceProjectionContext(diagnosticContext, payloadType,
-                initialState, logger);
+            new VP8AdaptiveSourceProjectionContext(diagnosticContext, initialState, logger);
 
         int targetTid = 0;
         int decodableTid = 0;
@@ -747,7 +752,7 @@ public class VP8AdaptiveSourceProjectionTest
             PacketInfo packetInfo = generator.nextPacket();
             Vp8Packet packet = packetInfo.packetAs();
 
-            boolean accepted = context.accept(packetInfo, RtpLayerDesc.getIndex(0, 0, packet.getTemporalLayerIndex()), targetIndex);
+            boolean accepted = context.accept(packetInfo, targetIndex, ALL_LIVE);
 
             if (packet.isStartOfFrame() && packet.getTemporalLayerIndex() == 0)
             {
@@ -814,9 +819,7 @@ public class VP8AdaptiveSourceProjectionTest
             new RtpState(1, 10000, 1000000);
 
         VP8AdaptiveSourceProjectionContext context =
-            new VP8AdaptiveSourceProjectionContext(diagnosticContext,
-                payloadType,
-                initialState, logger);
+            new VP8AdaptiveSourceProjectionContext(diagnosticContext, initialState, logger);
 
         int expectedSeq = 10001;
         long expectedTs = 1003000;
@@ -829,7 +832,7 @@ public class VP8AdaptiveSourceProjectionTest
             Vp8Packet packet = packetInfo.packetAs();
 
             boolean accepted =
-                context.accept(packetInfo, RtpLayerDesc.getIndex(0, 0, packet.getTemporalLayerIndex()), targetIndex);
+                context.accept(packetInfo, targetIndex, ALL_LIVE);
 
             if (packet.isStartOfFrame() && packet.getTemporalLayerIndex() == 0)
             {
@@ -882,7 +885,7 @@ public class VP8AdaptiveSourceProjectionTest
             }
             while (packet.getTemporalLayerIndex() > targetIndex);
 
-            assertTrue(context.accept(packetInfo, RtpLayerDesc.getIndex(0, 0, packet.getTemporalLayerIndex()), targetIndex));
+            assertTrue(context.accept(packetInfo, targetIndex, ALL_LIVE));
             context.rewriteRtp(packetInfo);
 
             /* Allow any values after a gap. */
@@ -905,7 +908,7 @@ public class VP8AdaptiveSourceProjectionTest
                 packet = packetInfo.packetAs();
 
                 boolean accepted = context
-                    .accept(packetInfo, packet.getTemporalLayerIndex(), targetIndex);
+                    .accept(packetInfo, targetIndex, ALL_LIVE);
 
                 if (packet.isStartOfFrame()
                     && packet.getTemporalLayerIndex() == 0)
@@ -978,6 +981,194 @@ public class VP8AdaptiveSourceProjectionTest
     }
 
 
+    /**
+     * Feeds frames from two encodings' generators to a context in lockstep. Asserts that each frame of encoding 0
+     * is accepted iff {@code accept0}, and each frame of encoding 1 iff {@code accept1}.
+     */
+    private static void runTwoStreams(
+        VP8AdaptiveSourceProjectionContext context,
+        Vp8PacketGenerator generator0, Vp8PacketGenerator generator1,
+        int targetIndex, EncodingLiveness liveness, int numPackets,
+        boolean accept0, boolean accept1)
+    {
+        for (int i = 0; i < numPackets; i++)
+        {
+            assertEquals(accept0, context.accept(generator0.nextPacket(), targetIndex, liveness));
+            assertEquals(accept1, context.accept(generator1.nextPacket(), targetIndex, liveness));
+        }
+    }
+
+    /**
+     * Sets up a context forwarding encoding 1 of a two-encoding source to a receiver wanting encoding 1. The
+     * keyframes which start both streams arrive together, and the keyframe on encoding 1 is taken.
+     */
+    private VP8AdaptiveSourceProjectionContext startOnEncoding1(
+        Vp8PacketGenerator generator0, Vp8PacketGenerator generator1, String testName)
+    {
+        DiagnosticContext diagnosticContext = new DiagnosticContext();
+        diagnosticContext.put("test", testName);
+        VP8AdaptiveSourceProjectionContext context =
+            new VP8AdaptiveSourceProjectionContext(diagnosticContext, new RtpState(1, 10000, 1000000), logger);
+        int targetIndex = RtpLayerDesc.getIndex(1, 0, 2);
+
+        /* The first packet of the encoding 0 keyframe is taken, then cut off once the encoding 1 keyframe arrives. */
+        assertTrue(context.accept(generator0.nextPacket(), targetIndex, ALL_LIVE));
+        assertTrue(context.accept(generator1.nextPacket(), targetIndex, ALL_LIVE));
+        /* 299 more packets each brings both generators to a frame boundary, 100 frames (3.3 seconds) in. */
+        runTwoStreams(context, generator0, generator1, targetIndex, ALL_LIVE, 299, false, true);
+        assertFalse(context.needsKeyframe());
+        return context;
+    }
+
+    @Test
+    public void loneLowerKeyframeDoesNotDemoteTest()
+    {
+        Vp8PacketGenerator generator0 = new Vp8PacketGenerator(3, 0);
+        Vp8PacketGenerator generator1 = new Vp8PacketGenerator(3, 1);
+        generator1.setSsrc(0xdeadbeefL);
+        VP8AdaptiveSourceProjectionContext context =
+            startOnEncoding1(generator0, generator1, "loneLowerKeyframeDoesNotDemoteTest");
+        int targetIndex = RtpLayerDesc.getIndex(1, 0, 2);
+
+        /* A keyframe on encoding 0 alone, as another receiver's request would produce from a sender which generates
+           keyframes per encoding. We keep forwarding encoding 1 and don't take it. */
+        generator0.requestKeyframe();
+        runTwoStreams(context, generator0, generator1, targetIndex, ALL_LIVE, 300, false, true);
+        assertFalse(context.needsKeyframe());
+    }
+
+    @Test
+    public void loneRefreshKeyframeDuringDownswitchTest()
+    {
+        Vp8PacketGenerator generator0 = new Vp8PacketGenerator(3, 0);
+        Vp8PacketGenerator generator1 = new Vp8PacketGenerator(3, 1);
+        generator1.setSsrc(0xdeadbeefL);
+        VP8AdaptiveSourceProjectionContext context =
+            startOnEncoding1(generator0, generator1, "loneRefreshKeyframeDuringDownswitchTest");
+
+        /* Switch the target down to encoding 0. Until its keyframe arrives, only TL0 of encoding 1 is forwarded. */
+        int targetIndex = RtpLayerDesc.getIndex(0, 0, 2);
+        for (int i = 0; i < 300; i++)
+        {
+            assertFalse(context.accept(generator0.nextPacket(), targetIndex, ALL_LIVE));
+            PacketInfo packetInfo1 = generator1.nextPacket();
+            Vp8Packet packet1 = packetInfo1.packetAs();
+            assertEquals(packet1.getTemporalLayerIndex() == 0, context.accept(packetInfo1, targetIndex, ALL_LIVE));
+        }
+        assertTrue(context.needsKeyframe());
+
+        /* A keyframe on encoding 1 alone, as another receiver's request would produce. It is what we're forwarding,
+           so it must be taken, or its successors would be undecodable; and it doesn't satisfy our need for an
+           encoding 0 keyframe. */
+        generator1.requestKeyframe();
+        for (int i = 0; i < 3; i++)
+        {
+            assertFalse(context.accept(generator0.nextPacket(), targetIndex, ALL_LIVE));
+            PacketInfo packetInfo1 = generator1.nextPacket();
+            Vp8Packet packet1 = packetInfo1.packetAs();
+            assertEquals(i == 0, packet1.isStartOfFrame());
+            if (i == 0)
+            {
+                assertTrue(packet1.isKeyframe());
+            }
+            assertTrue(context.accept(packetInfo1, targetIndex, ALL_LIVE));
+        }
+        for (int i = 0; i < 30; i++)
+        {
+            assertFalse(context.accept(generator0.nextPacket(), targetIndex, ALL_LIVE));
+            PacketInfo packetInfo1 = generator1.nextPacket();
+            Vp8Packet packet1 = packetInfo1.packetAs();
+            assertEquals(packet1.getTemporalLayerIndex() == 0, context.accept(packetInfo1, targetIndex, ALL_LIVE));
+        }
+        assertTrue(context.needsKeyframe());
+
+        /* The encoding 0 keyframe completes the switch. */
+        generator0.requestKeyframe();
+        runTwoStreams(context, generator0, generator1, targetIndex, ALL_LIVE, 300, true, false);
+        assertFalse(context.needsKeyframe());
+    }
+
+    @Test
+    public void targetNotBeingSentDoesNotRequestTest()
+    {
+        Vp8PacketGenerator generator0 = new Vp8PacketGenerator(3, 0);
+        Vp8PacketGenerator generator1 = new Vp8PacketGenerator(3, 1);
+        generator1.setSsrc(0xdeadbeefL);
+        VP8AdaptiveSourceProjectionContext context =
+            startOnEncoding1(generator0, generator1, "targetNotBeingSentDoesNotRequestTest");
+
+        /* The target moves up to encoding 2, which the sender is not sending. We're already forwarding the best
+           encoding at or below it that is, so there is nothing to ask for. */
+        EncodingLiveness only01 = TestEncodingLivenessKt.liveEncodings(eid -> eid <= 1);
+        int targetIndex = RtpLayerDesc.getIndex(2, 0, 2);
+        for (int i = 0; i < 300; i++)
+        {
+            assertFalse(context.accept(generator0.nextPacket(), targetIndex, only01));
+            assertTrue(context.accept(generator1.nextPacket(), targetIndex, only01));
+            assertFalse(context.needsKeyframe());
+        }
+    }
+
+    @Test
+    public void pendingSwitchDroppedWhenTargetStopsTest()
+    {
+        Vp8PacketGenerator generator0 = new Vp8PacketGenerator(3, 0);
+        Vp8PacketGenerator generator1 = new Vp8PacketGenerator(3, 1);
+        generator1.setSsrc(0xdeadbeefL);
+        VP8AdaptiveSourceProjectionContext context =
+            startOnEncoding1(generator0, generator1, "pendingSwitchDroppedWhenTargetStopsTest");
+
+        /* The target moves up to encoding 2 while it is being sent: we ask for its keyframe. */
+        int targetIndex = RtpLayerDesc.getIndex(2, 0, 2);
+        runTwoStreams(context, generator0, generator1, targetIndex, ALL_LIVE, 30, false, true);
+        assertTrue(context.needsKeyframe());
+
+        /* The sender turns encoding 2 off before answering. Encoding 1, which we're forwarding, is now the best at
+           or below the target that is being sent, so a keyframe would change nothing: stop asking. */
+        EncodingLiveness only01 = TestEncodingLivenessKt.liveEncodings(eid -> eid <= 1);
+        runTwoStreams(context, generator0, generator1, targetIndex, only01, 3, false, true);
+        assertFalse(context.needsKeyframe());
+        assertFalse(context.shouldRequestKeyframe());
+        runTwoStreams(context, generator0, generator1, targetIndex, only01, 300, false, true);
+        assertFalse(context.needsKeyframe());
+    }
+
+    @Test
+    public void stoppedEncodingTakesLowerKeyframeTest()
+    {
+        Vp8PacketGenerator generator0 = new Vp8PacketGenerator(3, 0);
+        Vp8PacketGenerator generator1 = new Vp8PacketGenerator(3, 1);
+        generator1.setSsrc(0xdeadbeefL);
+        VP8AdaptiveSourceProjectionContext context =
+            startOnEncoding1(generator0, generator1, "stoppedEncodingTakesLowerKeyframeTest");
+        int targetIndex = RtpLayerDesc.getIndex(1, 0, 2);
+
+        /* The sender stops encoding 1. Once we notice, the flow of encoding 0 frames makes us ask for a keyframe. */
+        EncodingLiveness only0 = TestEncodingLivenessKt.liveEncodings(eid -> eid == 0);
+        boolean needed = false;
+        for (int i = 0; i < 300; i++)
+        {
+            assertFalse(context.accept(generator0.nextPacket(), targetIndex, only0));
+            needed |= context.needsKeyframe();
+        }
+        assertTrue(needed);
+
+        /* The encoding 0 keyframe, alone, is taken, and we're forwarding encoding 0, which is the best we can get. */
+        generator0.requestKeyframe();
+        for (int i = 0; i < 300; i++)
+        {
+            PacketInfo packetInfo0 = generator0.nextPacket();
+            Vp8Packet packet0 = packetInfo0.packetAs();
+            if (i == 0)
+            {
+                assertTrue(packet0.isStartOfFrame());
+                assertTrue(packet0.isKeyframe());
+            }
+            assertTrue(context.accept(packetInfo0, targetIndex, only0));
+        }
+        assertFalse(context.needsKeyframe());
+    }
+
     private static class Vp8PacketGenerator {
         private static final byte[] vp8PacketTemplate =
             DatatypeConverter.parseHexBinary(
@@ -1005,11 +1196,18 @@ public class VP8AdaptiveSourceProjectionTest
 
         final int packetsPerFrame;
 
-        Vp8PacketGenerator(int packetsPerFrame)
+        final int encodingId;
+
+        Vp8PacketGenerator(int packetsPerFrame, int encodingId)
         {
             this.packetsPerFrame = packetsPerFrame;
+            this.encodingId = encodingId;
 
             reset();
+        }
+
+        Vp8PacketGenerator(int packetsPerFrame) {
+            this(packetsPerFrame, 0);
         }
 
         private int seq;
@@ -1026,8 +1224,8 @@ public class VP8AdaptiveSourceProjectionTest
         private int octetCount;
         private int frameCount;
 
-        private static final long baseReceivedTime = 1577836800000L; /* 2020-01-01 00:00:00 UTC */
-        private long receivedTime;
+        private static final Instant baseReceivedTime = Instant.ofEpochMilli(1577836800000L); /* 2020-01-01 00:00:00 UTC */
+        private Instant receivedTime;
 
         void reset()
         {
@@ -1112,6 +1310,7 @@ public class VP8AdaptiveSourceProjectionTest
             rtpPacket.setMarked(endOfFrame);
 
             Vp8Packet vp8Packet = rtpPacket.toOtherType(Vp8Packet::new);
+            vp8Packet.setEncodingId(encodingId);
 
             /* Make sure our manipulations of the raw buffer were correct. */
             assertEquals(startOfFrame, vp8Packet.isStartOfFrame());
@@ -1144,7 +1343,7 @@ public class VP8AdaptiveSourceProjectionTest
                     tidCycle = 0;
                 }
                 frameCount++;
-                receivedTime = baseReceivedTime + frameCount * 100 / 3;
+                receivedTime = baseReceivedTime.plus(Duration.ofMillis(frameCount * 100L / 3));
             }
             else
             {
@@ -1187,7 +1386,7 @@ public class VP8AdaptiveSourceProjectionTest
             srPacketBuilder.getRtcpHeader().setSenderSsrc(ssrc);
 
             SenderInfoBuilder siBuilder = srPacketBuilder.getSenderInfo();
-            setSIBuilderNtp(srPacketBuilder.getSenderInfo(), receivedTime);
+            setSIBuilderNtp(srPacketBuilder.getSenderInfo(), receivedTime.toEpochMilli());
             siBuilder.setRtpTimestamp(ts);
             siBuilder.setSendersOctetCount(packetCount);
             siBuilder.setSendersOctetCount(octetCount);

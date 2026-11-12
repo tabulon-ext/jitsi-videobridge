@@ -17,12 +17,12 @@ package org.jitsi.videobridge.cc;
 
 import org.jetbrains.annotations.*;
 import org.jitsi.nlj.*;
-import org.jitsi.nlj.format.*;
 import org.jitsi.nlj.rtp.*;
 import org.jitsi.rtp.rtcp.*;
 import org.jitsi.rtp.util.*;
 import org.jitsi.utils.logging2.*;
-import org.json.simple.*;
+import com.fasterxml.jackson.databind.node.JsonNodeFactory;
+import com.fasterxml.jackson.databind.node.ObjectNode;
 
 /**
  * A generic implementation of an adaptive source projection context that can be
@@ -69,9 +69,9 @@ class GenericAdaptiveSourceProjectionContext
     private boolean needsKeyframe = true;
 
     /**
-     * Useful to determine whether a packet is a "keyframe".
+     * Useful to determine when we need to change generic projection contexts.
      */
-    private final PayloadType payloadType;
+    private final int payloadType;
 
     /**
      * The maximum sequence number that we have sent.
@@ -109,7 +109,7 @@ class GenericAdaptiveSourceProjectionContext
      * @param rtpState the RTP state (i.e. seqnum, timestamp to start with, etc).
      */
     GenericAdaptiveSourceProjectionContext(
-            @NotNull PayloadType payloadType,
+            int payloadType,
             @NotNull RtpState rtpState,
             @NotNull Logger parentLogger)
     {
@@ -125,19 +125,18 @@ class GenericAdaptiveSourceProjectionContext
      * Determines whether an RTP packet from the incoming source should be accepted
      * or not. If the source is currently suspended, a key frame is necessary to
      * start accepting packets again.
-     *
+     * <p>
      * Note that, at the time of this writing, there's no practical need for a
      * synchronized keyword because there's only one thread (the translator
      * thread) accessing this method at a time.
      *
-     * @param packetInfo the RTP packet to determine whether to accept or not.
-     * @param incomingIndex the quality index of the
+     * @param packetInfo  the RTP packet to determine whether to accept or not.
      * @param targetIndex the target quality index
      * @return true if the packet should be accepted, false otherwise.
      */
     @Override
     public synchronized boolean
-    accept(@NotNull PacketInfo packetInfo, int incomingIndex, int targetIndex)
+    accept(@NotNull PacketInfo packetInfo, int targetIndex, @NotNull EncodingLiveness liveness)
     {
         VideoRtpPacket rtpPacket = packetInfo.packetAs();
         if (targetIndex == RtpLayerDesc.SUSPENDED_INDEX)
@@ -215,7 +214,7 @@ class GenericAdaptiveSourceProjectionContext
             }
 
             if (RtpUtils.isNewerTimestampThan(
-                destinationSequenceNumber, maxDestinationTimestamp))
+                destinationTimestamp, maxDestinationTimestamp))
             {
                 maxDestinationTimestamp = destinationTimestamp;
             }
@@ -247,7 +246,7 @@ class GenericAdaptiveSourceProjectionContext
         }
 
         if (RtpUtils.isNewerTimestampThan(
-            maxDestinationSequenceNumber, sourceTimestamp))
+            maxDestinationTimestamp, sourceTimestamp))
         {
             long destinationTimestamp =
                     RtpUtils.applyTimestampDelta(maxDestinationTimestamp, 3000);
@@ -327,8 +326,7 @@ class GenericAdaptiveSourceProjectionContext
                 ssrc, maxDestinationSequenceNumber, maxDestinationTimestamp);
     }
 
-    @Override
-    public PayloadType getPayloadType()
+    public int getPayloadType()
     {
         return payloadType;
     }
@@ -338,10 +336,9 @@ class GenericAdaptiveSourceProjectionContext
      * @return
      */
     @Override
-    @SuppressWarnings("unchecked")
-    public JSONObject getDebugState()
+    public ObjectNode getDebugState()
     {
-        JSONObject debugState = new JSONObject();
+        ObjectNode debugState = JsonNodeFactory.instance.objectNode();
         debugState.put(
                 "class",
                 GenericAdaptiveSourceProjectionContext.class.getSimpleName());

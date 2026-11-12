@@ -29,21 +29,20 @@ import kotlin.collections.ArrayList
  *
  * @author Jonathan Lennox
  */
-class Vp9Picture(packet: Vp9Packet) {
+class Vp9Picture(packet: Vp9Packet, index: Long) {
     val frames = ArrayList<Vp9Frame?>()
 
     init {
         val sid = packet.effectiveSpatialLayerIndex
 
-        setFrameAtSid(Vp9Frame(packet), sid)
+        setFrameAtSid(Vp9Frame(packet, index), sid)
     }
 
     fun frame(sid: Int) = frames.getOrNull(sid)
 
     fun frame(packet: Vp9Packet) = frame(packet.effectiveSpatialLayerIndex)
 
-    private fun setFrameAtSid(frame: Vp9Frame, sid: Int) =
-        frames.setAndExtend(sid, frame, null)
+    private fun setFrameAtSid(frame: Vp9Frame, sid: Int) = frames.setAndExtend(sid, frame, null)
 
     /**
      * Return the first (lowest-sid, earliest in decoding order) frame that we've received so far.
@@ -83,6 +82,9 @@ class Vp9Picture(packet: Vp9Packet) {
     val pictureId: Int
         get() = firstFrame().pictureId
 
+    val index: Long
+        get() = firstFrame().index
+
     val tl0PICIDX: Int
         get() = firstFrame().tl0PICIDX
 
@@ -105,7 +107,7 @@ class Vp9Picture(packet: Vp9Packet) {
             return PacketInsertionResult(f, this, false)
         }
 
-        val newF = Vp9Frame(packet)
+        val newF = Vp9Frame(packet, index)
 
         setFrameAtSid(newF, sid)
 
@@ -124,9 +126,7 @@ class Vp9Picture(packet: Vp9Packet) {
      * argument is part of the VP9 picture that is represented by this
      * [Vp9Picture] instance, false otherwise.
      */
-    private fun matchesSSRC(pkt: VideoRtpPacket): Boolean {
-        return ssrc == pkt.ssrc
-    }
+    private fun matchesSSRC(pkt: VideoRtpPacket): Boolean = ssrc == pkt.ssrc
 
     /**
      * Checks whether the specified RTP packet is part of this frame.
@@ -135,9 +135,7 @@ class Vp9Picture(packet: Vp9Packet) {
      * @return true if the specified RTP packet is part of this frame, false
      * otherwise.
      */
-    fun matchesPicture(pkt: Vp9Packet): Boolean {
-        return matchesSSRC(pkt) && timestamp == pkt.timestamp
-    }
+    fun matchesPicture(pkt: Vp9Packet): Boolean = matchesSSRC(pkt) && timestamp == pkt.timestamp
 
     /**
      * Validates that the specified RTP packet consistently matches all the
@@ -150,7 +148,6 @@ class Vp9Picture(packet: Vp9Packet) {
      * @throws RuntimeException if the specified RTP packet is inconsistent with this frame
      */
     fun validateConsistency(pkt: Vp9Packet) {
-
         val f = frame(pkt)
         if (f != null) {
             f.validateConsistency(pkt)
@@ -196,10 +193,8 @@ class Vp9Picture(packet: Vp9Packet) {
      * Check whether this picture is immediately after another one, according
      * to their extended picture IDs.
      */
-    fun isImmediatelyAfter(otherPicture: Vp9Picture): Boolean {
-        return pictureId ==
-            applyExtendedPictureIdDelta(otherPicture.pictureId, 1)
-    }
+    fun isImmediatelyAfter(otherPicture: Vp9Picture): Boolean = pictureId ==
+        applyExtendedPictureIdDelta(otherPicture.pictureId, 1)
 }
 
 /**

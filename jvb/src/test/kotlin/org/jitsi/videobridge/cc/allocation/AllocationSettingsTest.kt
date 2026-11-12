@@ -16,44 +16,109 @@
 package org.jitsi.videobridge.cc.allocation
 
 import io.kotest.core.spec.style.ShouldSpec
-import io.kotest.matchers.maps.shouldContainExactly
 import io.kotest.matchers.shouldBe
+import org.jitsi.config.withNewConfig
+import org.jitsi.videobridge.message.ReceiverVideoConstraintsMessage
 
 class AllocationSettingsTest : ShouldSpec() {
     init {
         context("computeVideoConstraints") {
-            context("Stage view behavior") {
-                val allocationSettings = AllocationSettingsWrapper()
-                allocationSettings.setMaxFrameHeight(720)
-                allocationSettings.setSelectedEndpoints(listOf("A"))
-
-                // This tests the legacy API, which intentionally translates "selected" to "on-stage".
-                allocationSettings.get().selectedEndpoints shouldBe emptyList()
-                allocationSettings.get().onStageEndpoints shouldBe listOf("A")
-                allocationSettings.get().videoConstraints.shouldContainExactly(
-                    mapOf(
-                        "A" to VideoConstraints(720)
+            context("With client which supports source names") {
+                context("no conversion from endpoint to source takes place") {
+                    val allocationSettings = AllocationSettingsWrapper()
+                    allocationSettings.setBandwidthAllocationSettings(
+                        ReceiverVideoConstraintsMessage(
+                            onStageSources = listOf("S1", "S2"),
+                            selectedSources = listOf("S3", "S4"),
+                            constraints = mapOf(
+                                "S1" to VideoConstraints(720),
+                                "E1" to VideoConstraints(360)
+                            )
+                        )
                     )
-                )
+
+                    allocationSettings.get().onStageSources shouldBe listOf("S1", "S2")
+                    allocationSettings.get().selectedSources shouldBe listOf("S3", "S4")
+
+                    allocationSettings.get().onStageEndpoints shouldBe emptyList()
+                    allocationSettings.get().selectedEndpoints shouldBe emptyList()
+
+                    allocationSettings.get().videoConstraints shouldBe mapOf(
+                        "S1" to VideoConstraints(720),
+                        // There's no error when endpoint is used in constraint
+                        "E1" to VideoConstraints(360)
+                    )
+                }
             }
-            context("Tile view behavior") {
-                val allocationSettings = AllocationSettingsWrapper()
-                allocationSettings.setMaxFrameHeight(180)
-                allocationSettings.setSelectedEndpoints(listOf("A", "B", "C", "D"))
-
-                allocationSettings.get().onStageEndpoints shouldBe emptyList()
-                allocationSettings.get().videoConstraints.shouldContainExactly(
-                    mapOf(
-                        "A" to VideoConstraints(180),
-                        "B" to VideoConstraints(180),
-                        "C" to VideoConstraints(180),
-                        "D" to VideoConstraints(180)
-                    )
-                )
-                // The legacy API (currently used by jitsi-meet) uses "selected count > 0" to infer TileView, and the
-                // desired behavior in TileView is to not have selected endpoints.
-                allocationSettings.get().selectedEndpoints shouldBe emptyList()
-                allocationSettings.get().onStageEndpoints shouldBe emptyList()
+            context("with initial constraints different from default default constraints") {
+                withNewConfig(
+                    """
+                        videobridge.cc.initial-max-height-px = 0
+                        videobridge.cc.default-max-height-px = 180
+                    """.trimIndent()
+                ) {
+                    should("consider an empty receiver video constraints a change") {
+                        val allocationSettings = AllocationSettingsWrapper()
+                        val changed =
+                            allocationSettings.setBandwidthAllocationSettings(ReceiverVideoConstraintsMessage())
+                        changed shouldBe true
+                    }
+                    should("consider the default receiver video constraints a change") {
+                        val allocationSettings = AllocationSettingsWrapper()
+                        val changed =
+                            allocationSettings.setBandwidthAllocationSettings(
+                                ReceiverVideoConstraintsMessage(defaultConstraints = VideoConstraints(maxHeight = 180))
+                            )
+                        changed shouldBe true
+                    }
+                    should("not consider the initial receiver video constraints a change") {
+                        val allocationSettings = AllocationSettingsWrapper()
+                        val changed =
+                            allocationSettings.setBandwidthAllocationSettings(
+                                ReceiverVideoConstraintsMessage(defaultConstraints = VideoConstraints(maxHeight = 0))
+                            )
+                        changed shouldBe false
+                    }
+                    should("not apply the default default constraints after they've been set explicitly") {
+                        val allocationSettings = AllocationSettingsWrapper()
+                        allocationSettings.setBandwidthAllocationSettings(
+                            ReceiverVideoConstraintsMessage(defaultConstraints = VideoConstraints(maxHeight = 720))
+                        )
+                        val changed = allocationSettings.setBandwidthAllocationSettings(
+                            ReceiverVideoConstraintsMessage()
+                        )
+                        changed shouldBe false
+                        allocationSettings.get().defaultConstraints shouldBe VideoConstraints(maxHeight = 720)
+                    }
+                }
+            }
+            context("With an assumed bandwidth limit set") {
+                withNewConfig("videobridge.cc.assumed-bandwidth-limit = 10 Mbps") {
+                    should("limit an assumed bandwidth to the desired rate") {
+                        val allocationSettings = AllocationSettingsWrapper()
+                        val changed = allocationSettings.setBandwidthAllocationSettings(
+                            ReceiverVideoConstraintsMessage(assumedBandwidthBps = 20_000_000)
+                        )
+                        changed shouldBe true
+                        allocationSettings.get().assumedBandwidthBps shouldBe 10_000_000
+                    }
+                    should("Not limit a value less than the configured limit") {
+                        val allocationSettings = AllocationSettingsWrapper()
+                        val changed = allocationSettings.setBandwidthAllocationSettings(
+                            ReceiverVideoConstraintsMessage(assumedBandwidthBps = 2_000_000)
+                        )
+                        changed shouldBe true
+                        allocationSettings.get().assumedBandwidthBps shouldBe 2_000_000
+                    }
+                    should("Not consider the default value to be a change") {
+                        val allocationSettings = AllocationSettingsWrapper()
+                        // Set this twice because of the initial vs. default max height difference above.
+                        val constraints = ReceiverVideoConstraintsMessage(assumedBandwidthBps = -1)
+                        allocationSettings.setBandwidthAllocationSettings(constraints)
+                        val changed = allocationSettings.setBandwidthAllocationSettings(constraints)
+                        changed shouldBe false
+                    }
+                }
             }
         }
     }

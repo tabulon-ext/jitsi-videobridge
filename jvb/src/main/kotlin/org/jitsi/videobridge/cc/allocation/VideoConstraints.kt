@@ -16,22 +16,34 @@
 package org.jitsi.videobridge.cc.allocation
 
 import com.fasterxml.jackson.annotation.JsonIgnoreProperties
-import org.json.simple.JSONObject
+import com.fasterxml.jackson.databind.node.JsonNodeFactory
 
 @JsonIgnoreProperties(ignoreUnknown = true)
-data class VideoConstraints(
+data class VideoConstraints @JvmOverloads constructor(
     val maxHeight: Int,
-    val maxFrameRate: Double = -1.0
+    val maxFrameRate: Double = UNLIMITED_FRAME_RATE
 ) {
-    override fun toString(): String = JSONObject().apply {
-        this["maxHeight"] = maxHeight
-        this["maxFrameRate"] = maxFrameRate
-    }.toJSONString()
+    init {
+        require(maxHeight == UNLIMITED_HEIGHT || maxHeight >= 0) { "maxHeight must be either -1, 0, or positive." }
+        require(maxFrameRate == UNLIMITED_FRAME_RATE || maxFrameRate >= 0.0) {
+            "maxFrameRate must be either -1, or >= 0"
+        }
+    }
+    override fun toString(): String = JsonNodeFactory.instance.objectNode().apply {
+        put("maxHeight", maxHeight)
+        put("maxFrameRate", maxFrameRate)
+    }.toString()
+
+    fun heightIsLimited() = maxHeight != UNLIMITED_HEIGHT
+    fun frameRateIsLimited() = maxFrameRate != UNLIMITED_FRAME_RATE
+    fun isDisabled() = maxHeight == 0 || maxFrameRate == 0.0
 
     companion object {
+        const val UNLIMITED_HEIGHT = -1
+        const val UNLIMITED_FRAME_RATE = -1.0
         val NOTHING = VideoConstraints(0)
+        val UNLIMITED = VideoConstraints(UNLIMITED_HEIGHT, UNLIMITED_FRAME_RATE)
     }
 }
 
-fun Map<String, VideoConstraints>.prettyPrint(): String =
-    entries.joinToString { "${it.key}->${it.value.maxHeight}" }
+fun Map<String, VideoConstraints>.prettyPrint(): String = entries.joinToString { "${it.key}->${it.value.maxHeight}" }

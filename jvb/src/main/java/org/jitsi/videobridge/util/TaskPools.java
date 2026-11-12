@@ -18,7 +18,8 @@ package org.jitsi.videobridge.util;
 
 import org.jitsi.utils.concurrent.*;
 import org.jitsi.utils.logging2.*;
-import org.json.simple.*;
+import com.fasterxml.jackson.databind.node.JsonNodeFactory;
+import com.fasterxml.jackson.databind.node.ObjectNode;
 
 import java.util.concurrent.*;
 
@@ -40,14 +41,19 @@ public class TaskPools
                     Runtime.getRuntime().availableProcessors(),
                     new CustomizableThreadFactory("Global CPU pool", false)
             );
-
-    public static final ScheduledExecutorService SCHEDULED_POOL =
+    private final static ScheduledExecutorService DEFAULT_SCHEDULED_POOL =
             Executors.newSingleThreadScheduledExecutor(new CustomizableThreadFactory("Global scheduled pool", false));
+    public static ScheduledExecutorService SCHEDULED_POOL = DEFAULT_SCHEDULED_POOL;
 
-    @SuppressWarnings("unchecked")
-    public static JSONObject getStatsJson(ExecutorService es)
+    public static void resetScheduledPool()
     {
-        JSONObject debugState = new JSONObject();
+        SCHEDULED_POOL = DEFAULT_SCHEDULED_POOL;
+    }
+
+
+    public static ObjectNode getStatsJson(ExecutorService es)
+    {
+        ObjectNode debugState = JsonNodeFactory.instance.objectNode();
         debugState.put("executor_class", es.getClass().getSimpleName());
 
         if (es instanceof ThreadPoolExecutor)
@@ -66,13 +72,12 @@ public class TaskPools
         return debugState;
     }
 
-    @SuppressWarnings("unchecked")
-    public static JSONObject getStatsJson()
+    public static ObjectNode getStatsJson()
     {
-        JSONObject debugState = new JSONObject();
+        ObjectNode debugState = JsonNodeFactory.instance.objectNode();
 
-        debugState.put("IO_POOL", getStatsJson(IO_POOL));
-        debugState.put("CPU_POOL", getStatsJson(CPU_POOL));
+        debugState.set("IO_POOL", getStatsJson(IO_POOL));
+        debugState.set("CPU_POOL", getStatsJson(CPU_POOL));
 
         return debugState;
     }
